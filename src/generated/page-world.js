@@ -61,6 +61,9 @@ let cacheBytes = 0;
 let prefetchHitCount = 0;
 let rangeChunkRetryCount = 0;
 let lastMediaUrl = null;
+let lastLivePlaylistUrl = null;
+let lastLivePlaylistRefreshAt = 0;
+let inflightLivePlaylistRefresh = null;
 let activeRangeChunkJobs = 0;
 let lastBufferedRangeEnd = 0;
 let downloadController = {
@@ -133,6 +136,7 @@ try {
     installXhrHook();
     installMediaHooks();
     installMseHooks();
+    installVisibilityHooks();
     installDebugSurface();
     installDownloadController();
     publishStatus();
@@ -305,6 +309,23 @@ function installMediaHooks() {
     const observer = new MutationObserver(() => attach());
     observer.observe(document.documentElement, { childList: true, subtree: true });
     attach();
+}
+function installVisibilityHooks() {
+    document.addEventListener("visibilitychange", () => {
+        refreshDownloadController(true);
+        if (document.hidden) {
+            if (pageKind === "vod") {
+                const seedUrl = lastMediaUrl ?? vodSelection.videoBaseUrl ?? vodSelection.audioBaseUrl;
+                if (seedUrl) {
+                    scheduleVodPrefetch(seedUrl);
+                }
+            }
+            else if (pageKind === "live") {
+                void maybeRefreshLivePlaylist(true);
+            }
+        }
+        publishStatus();
+    });
 }
 function installMseHooks() {
     const mediaSourceProto = window.MediaSource?.prototype;
@@ -794,6 +815,9 @@ function installDebugSurface() {
 function installDownloadController() {
     window.setInterval(() => {
         refreshDownloadController();
+        if (pageKind === "live" && document.hidden) {
+            void maybeRefreshLivePlaylist();
+        }
         if (pageKind === "live" || prefetchQueue.length > 0 || prefetchActive > 0 || inflightRangeRequests.size > 0) {
             publishStatus();
         }
@@ -1126,6 +1150,7 @@ async function scheduleLivePlaylistPrefetch(playlistUrl, response) {
     if (pageKind !== "live" || state.mode === "off") {
         return;
     }
+    lastLivePlaylistUrl = playlistUrl;
     const text = await response.text().catch(() => "");
     if (!text) {
         return;
@@ -1147,6 +1172,44 @@ async function scheduleLivePlaylistPrefetch(playlistUrl, response) {
         }
         liveSeenSegments.delete(first.value);
     }
+}
+async function maybeRefreshLivePlaylist(force = false) {
+    if (pageKind !== "live" || state.mode === "off" || !lastLivePlaylistUrl) {
+        return;
+    }
+    if (inflightLivePlaylistRefresh) {
+        return inflightLivePlaylistRefresh;
+    }
+    const activeSegmentDownloads = prefetchActive + inflightRangeRequests.size;
+    const queueDepth = prefetchQueue.length + activeSegmentDownloads;
+    const lowBuffer = state.bufferedSeconds < Math.max(2, policy.live.stableBufferTargetSeconds * 0.5);
+    if (!force && !lowBuffer && queueDepth >= 3) {
+        return;
+    }
+    const now = Date.now();
+    if (!force && now - lastLivePlaylistRefreshAt < 1000) {
+        return;
+    }
+    lastLivePlaylistRefreshAt = now;
+    const playlistUrl = lastLivePlaylistUrl;
+    inflightLivePlaylistRefresh = (async () => {
+        const started = performance.now();
+        const response = await nativeFetch(playlistUrl, { cache: "no-store", credentials: "include" }).catch(() => null);
+        const durationMs = Math.round(performance.now() - started);
+        if (!response?.ok) {
+            noteHostFailure(playlistUrl);
+            emitNetworkEvent("playlist", playlistUrl, durationMs, false, undefined, "background-refresh");
+            return;
+        }
+        noteHostSuccess(playlistUrl, durationMs);
+        const bytesHeader = response.headers.get("content-length");
+        const bytes = bytesHeader ? Number(bytesHeader) : undefined;
+        emitNetworkEvent("playlist", playlistUrl, durationMs, true, bytes, "background-refresh");
+        await scheduleLivePlaylistPrefetch(playlistUrl, response.clone());
+    })().finally(() => {
+        inflightLivePlaylistRefresh = null;
+    });
+    return inflightLivePlaylistRefresh;
 }
 function getVodPrefetchContext() {
     const video = document.querySelector("video");
@@ -1284,6 +1347,12 @@ async function runPrefetch(task) {
     const rangeEntry = task.kind === "media" && pageKind === "vod" ? await downloadPrefetchByRange(task) : null;
     if (rangeEntry) {
         storeCacheEntry(rangeEntry);
+        if (pageKind === "vod") {
+            scheduleVodPrefetch(task.url);
+        }
+        else if (pageKind === "live" && document.hidden) {
+            void maybeRefreshLivePlaylist();
+        }
         return rangeEntry;
     }
     const started = performance.now();
@@ -1311,6 +1380,12 @@ async function runPrefetch(task) {
     storeCacheEntry(entry);
     emitNetworkEvent("prefetch", task.url, durationMs, true, body.byteLength, task.priority);
     noteSegmentDuration(durationMs);
+    if (pageKind === "vod") {
+        scheduleVodPrefetch(task.url);
+    }
+    else if (pageKind === "live" && document.hidden) {
+        void maybeRefreshLivePlaylist();
+    }
     return entry;
 }
 async function downloadPrefetchByRange(task) {
