@@ -46,4 +46,20 @@ describe("selectRecoveryAction", () => {
 
     expect(action).toBe("prefer-stable-codec");
   });
+
+  it("does not run aggressive recovery while a user seek is still unresolved", () => {
+    const action = selectRecoveryAction({
+      pageKind: "vod",
+      mode: "stable",
+      bufferedSeconds: 0,
+      droppedFrames: 0,
+      backupHostsAvailable: true,
+      enableProtocolFallback: true,
+      hostFailures: 0,
+      repeatedStalls: 3,
+      seekInProgress: true,
+    });
+
+    expect(action).toBe("noop");
+  });
 });

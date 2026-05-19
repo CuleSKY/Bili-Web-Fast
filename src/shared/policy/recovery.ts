@@ -9,10 +9,14 @@ export interface RecoveryDecisionInput {
   enableProtocolFallback: boolean;
   hostFailures: number;
   repeatedStalls: number;
+  seekInProgress?: boolean;
 }
 
 export function selectRecoveryAction(input: RecoveryDecisionInput): string {
   if (input.mode === "off") {
+    return "noop";
+  }
+  if (input.seekInProgress) {
     return "noop";
   }
   if (input.bufferedSeconds < 1.25) {

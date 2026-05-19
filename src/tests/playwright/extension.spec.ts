@@ -16,8 +16,10 @@ test.describe("extension local harness", () => {
     });
   }
 
-  test("rewrites VOD playurl, injects overlay, and serves prefetched segment from cache", async ({ page }) => {
+  test("rewrites VOD playurl, injects overlay, and keeps HEAD or Range fetches out of streaming side effects", async ({ page }) => {
     const segmentCounts = new Map<string, number>();
+    const headCounts = new Map<string, number>();
+    const rangeCounts = new Map<string, number>();
     const vodDocument = `
       <html>
         <body>
@@ -29,9 +31,20 @@ test.describe("extension local harness", () => {
               const json = await playurl.json();
               window.__TEST__.playurl = json;
               const base = json.data.dash.video[0].baseUrl;
+              const next1 = base.replace("video100.m4s", "video101.m4s");
+              const next2 = base.replace("video100.m4s", "video102.m4s");
+              const next3 = base.replace("video100.m4s", "video103.m4s");
+              const headProbe = "https://upos-sz-mirror.bilivideo.com/upgcxcode/probe/head-only.m4s";
+              const rangeProbe = "https://upos-sz-mirror.bilivideo.com/upgcxcode/probe/range-only.m4s";
               await fetch(base);
-              await new Promise((resolve) => setTimeout(resolve, 400));
-              await fetch(base.replace("video100.m4s", "video101.m4s"));
+              await new Promise((resolve) => setTimeout(resolve, 600));
+              window.__TEST__.headStatus = (await fetch(headProbe, { method: "HEAD" })).status;
+              await fetch(next1);
+              await new Promise((resolve) => setTimeout(resolve, 600));
+              window.__TEST__.rangeStatus = (await fetch(new Request(rangeProbe, { headers: { range: "bytes=0-99" } }))).status;
+              await fetch(next2);
+              await new Promise((resolve) => setTimeout(resolve, 600));
+              await fetch(next3);
               document.querySelector("video").dispatchEvent(new Event("waiting"));
               window.__TEST__.done = true;
             })();
@@ -87,6 +100,30 @@ test.describe("extension local harness", () => {
         return;
       }
       if (url.endsWith(".m4s")) {
+        if (route.request().method() === "HEAD") {
+          headCounts.set(url, (headCounts.get(url) ?? 0) + 1);
+          await route.fulfill({
+            status: 200,
+            headers: { "content-type": "video/iso.segment", "content-length": "2097152" },
+            body: "",
+          });
+          return;
+        }
+        const range = route.request().headers().range;
+        if (range) {
+          rangeCounts.set(url, (rangeCounts.get(url) ?? 0) + 1);
+          await route.fulfill({
+            status: 206,
+            headers: {
+              "content-type": "video/iso.segment",
+              "content-length": "100",
+              "content-range": "bytes 0-99/2097152",
+              "accept-ranges": "bytes",
+            },
+            body: Buffer.alloc(100, 9),
+          });
+          return;
+        }
         segmentCounts.set(url, (segmentCounts.get(url) ?? 0) + 1);
         await route.fulfill({
           status: 200,
@@ -107,15 +144,106 @@ test.describe("extension local harness", () => {
     await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().quality)).toBe(120);
     await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().codec)).toContain("avc1");
     await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().lastRecoveryAction)).toBe("rebuild-playback-state");
+    expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/00/00/video100.m4s")).toBe(1);
     expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/00/00/video101.m4s")).toBe(1);
+    expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/00/00/video102.m4s")).toBe(1);
+    expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/00/00/video103.m4s")).toBe(1);
+    expect(headCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/probe/head-only.m4s")).toBeGreaterThanOrEqual(1);
+    expect(rangeCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/probe/range-only.m4s")).toBeGreaterThanOrEqual(1);
+    expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/probe/head-only.m4s") ?? 0).toBe(0);
+    expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/probe/range-only.m4s") ?? 0).toBe(0);
+    await expect.poll(async () => page.evaluate(() => ({
+      headStatus: (window as any).__TEST__?.headStatus,
+      rangeStatus: (window as any).__TEST__?.rangeStatus,
+    }))).toEqual({
+      headStatus: 200,
+      rangeStatus: 206,
+    });
     await expect.poll(async () => page.evaluate(() => ({
       activeRangeJobs: window.__BWF_DEBUG__?.getStatus().activeRangeJobs,
       prefetchHits: window.__BWF_DEBUG__?.getStatus().prefetchHitCount,
       targetQualitySatisfied: window.__BWF_DEBUG__?.getStatus().targetQualitySatisfied,
-    }))).toEqual({
+    }))).toMatchObject({
       activeRangeJobs: 0,
-      prefetchHits: 1,
       targetQualitySatisfied: true,
+    });
+    await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().prefetchHitCount ?? 0)).toBeGreaterThanOrEqual(3);
+  });
+
+  test("keeps unresolved seek out of aggressive recovery and does not reuse stale seek targets", async ({ page }) => {
+    const documentHtml = `
+      <html>
+        <body>
+          <video muted autoplay playsinline controls></video>
+          <script>
+            window.__SEEK_TEST__ = { rangeStart: 0, rangeEnd: 10 };
+            const video = document.querySelector("video");
+            Object.defineProperty(video, "buffered", {
+              configurable: true,
+              get() {
+                return {
+                  length: 1,
+                  start: () => window.__SEEK_TEST__.rangeStart,
+                  end: () => window.__SEEK_TEST__.rangeEnd,
+                };
+              },
+            });
+          </script>
+        </body>
+      </html>
+    `;
+
+    await page.route("**/*", async (route) => {
+      const url = route.request().url();
+      if (route.request().resourceType() === "document" && url === "https://www.bilibili.com/video/BV1seek/") {
+        await route.fulfill({ contentType: "text/html", body: documentHtml });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto("https://www.bilibili.com/video/BV1seek/");
+    await expectInjectedState(page);
+
+    await page.evaluate(() => {
+      const video = document.querySelector("video")!;
+      video.currentTime = 60;
+      video.dispatchEvent(new Event("seeking"));
+      video.dispatchEvent(new Event("waiting"));
+      video.dispatchEvent(new Event("stalled"));
+    });
+
+    await expect.poll(async () => page.evaluate(() => ({
+      seekInProgress: window.__BWF_DEBUG__?.getStatus().seekInProgress,
+      lastRecoveryAction: window.__BWF_DEBUG__?.getStatus().lastRecoveryAction,
+    }))).toEqual({
+      seekInProgress: true,
+      lastRecoveryAction: null,
+    });
+
+    await page.evaluate(() => {
+      (window as any).__SEEK_TEST__.rangeStart = 59;
+      (window as any).__SEEK_TEST__.rangeEnd = 70;
+      const video = document.querySelector("video")!;
+      video.dispatchEvent(new Event("seeked"));
+    });
+
+    await page.waitForTimeout(900);
+
+    await page.evaluate(() => {
+      const video = document.querySelector("video")!;
+      video.currentTime = 1;
+      video.dispatchEvent(new Event("waiting"));
+    });
+
+    await expect.poll(async () => page.evaluate(() => ({
+      seekInProgress: window.__BWF_DEBUG__?.getStatus().seekInProgress,
+      lastRecoveryAction: window.__BWF_DEBUG__?.getStatus().lastRecoveryAction,
+      currentTime: Math.round(document.querySelector("video")!.currentTime),
+    }))).toEqual({
+      seekInProgress: false,
+      lastRecoveryAction: "rebuild-playback-state",
+      currentTime: 1,
     });
   });
 
@@ -200,6 +328,78 @@ test.describe("extension local harness", () => {
     });
     await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().protocol)).toContain("flv");
     await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().liveBufferTier)).toBe("low");
+  });
+
+  test("continues live nested playlist prefetch through cached playlist hits and refreshes the leaf playlist", async ({ page }) => {
+    const requestCounts = new Map<string, number>();
+    const liveDocument = `
+      <html>
+        <body>
+          <video muted autoplay playsinline controls></video>
+        </body>
+      </html>
+    `;
+
+    await page.route("**/*", async (route) => {
+      const url = route.request().url();
+      if (route.request().resourceType() === "document" && url === "https://live.bilibili.com/9674115") {
+        await route.fulfill({ contentType: "text/html", body: liveDocument });
+        return;
+      }
+      if (url.endsWith(".m3u8")) {
+        requestCounts.set(url, (requestCounts.get(url) ?? 0) + 1);
+        await route.fulfill({
+          contentType: "application/vnd.apple.mpegurl",
+          body: url.endsWith("master.m3u8")
+            ? ["#EXTM3U", "level1.m3u8"].join("\n")
+            : ["#EXTM3U", "#EXT-X-MAP:URI=\"init.mp4\"", "#EXTINF:1.0,", "seg0001.m4s", "#EXTINF:1.0,", "seg0002.m4s"].join("\n"),
+        });
+        return;
+      }
+      if (url.endsWith(".mp4") || url.endsWith(".m4s")) {
+        requestCounts.set(url, (requestCounts.get(url) ?? 0) + 1);
+        await route.fulfill({
+          status: 200,
+          headers: { "content-type": "video/iso.segment", "content-length": "1048576" },
+          body: Buffer.alloc(1024, 4),
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto("https://live.bilibili.com/9674115");
+    await expectInjectedState(page);
+    await page.evaluate(async () => {
+      await fetch("https://live-play.acgvideo.com/live/master.m3u8");
+    });
+    await expect.poll(async () => requestCounts.get("https://live-play.acgvideo.com/live/level1.m3u8") ?? 0).toBe(1);
+    await expect.poll(async () => requestCounts.get("https://live-play.acgvideo.com/live/seg0002.m4s") ?? 0).toBe(1);
+    const playlistRequestsBeforeCacheHit = requestCounts.get("https://live-play.acgvideo.com/live/level1.m3u8") ?? 0;
+    await page.evaluate(async () => {
+      await fetch("https://live-play.acgvideo.com/live/level1.m3u8");
+    });
+    await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().prefetchHitCount)).toBeGreaterThan(0);
+
+    expect(requestCounts.get("https://live-play.acgvideo.com/live/level1.m3u8")).toBe(playlistRequestsBeforeCacheHit);
+    expect(requestCounts.get("https://live-play.acgvideo.com/live/init.mp4")).toBe(1);
+    expect(requestCounts.get("https://live-play.acgvideo.com/live/seg0001.m4s")).toBe(1);
+    expect(requestCounts.get("https://live-play.acgvideo.com/live/seg0002.m4s")).toBe(1);
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    });
+    await page.evaluate(async () => {
+      await window.__BWF_DEBUG__?.setMode("stable");
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    });
+    await expect.poll(async () => requestCounts.get("https://live-play.acgvideo.com/live/level1.m3u8") ?? 0).toBeGreaterThan(playlistRequestsBeforeCacheHit);
+    expect(requestCounts.get("https://live-play.acgvideo.com/live/master.m3u8")).toBe(1);
+    await page.evaluate(async () => {
+      await fetch("https://live-play.acgvideo.com/live/master.m3u8");
+    });
+    await expect.poll(async () => requestCounts.get("https://live-play.acgvideo.com/live/master.m3u8") ?? 0).toBeGreaterThan(1);
+    await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().prefetchHitCount)).toBeGreaterThan(0);
+    await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().cacheBytes ?? 0)).toBeLessThan(384 * 1024 * 1024);
   });
 
   test("overlay can be folded and hidden from page controls", async ({ page }) => {

@@ -9,6 +9,24 @@ import type {
 } from "../shared/types";
 import type { LiveProtocolPreference } from "../shared/types";
 import type { PageBridgeMessage, PolicyPatch } from "../shared/messaging/protocol";
+import { resolveDownloadController } from "../shared/policy/download-controller";
+import {
+  parseLivePlaylistItems,
+  resolveLiveCacheTargetBytes,
+  resolveLivePrefetchWindow,
+  sortLiveCandidates,
+} from "../shared/policy/live";
+import { resolvePrefetchDecision } from "../shared/policy/prefetch";
+import {
+  classifyResource,
+  getRequestSemantics,
+  shouldDriveStreamingPipeline,
+  shouldUseFullBodyCache,
+  shouldUseRangeSplitForRequest,
+  type ResourceKind,
+  type RequestSemantics,
+} from "../shared/policy/request";
+import { selectRecoveryAction } from "../shared/policy/recovery";
 
 type CandidateUrl = { host?: string; extra?: string };
 type HostFallbackEntry = { currentHost: string; backups: string[] };
@@ -115,6 +133,7 @@ interface SeekState {
   targetTime: number;
   targetBuffered: boolean;
   resolvedAt: number | null;
+  recoveryAnchorExpiresAt: number | null;
 }
 
 type BwfDebug = {
@@ -177,12 +196,15 @@ const hostFailures = new Map<string, number>();
 const hostHealth = new Map<string, HostHealth>();
 const hostFailureSamples: HostFailureSample[] = [];
 const segmentDurations: number[] = [];
+const liveSegmentDurations: number[] = [];
 const mediaCache = new Map<string, CacheEntry>();
 const inflightPrefetches = new Map<string, Promise<CacheEntry | null>>();
 const prefetchQueue: PrefetchTask[] = [];
 const liveSeenSegments = new Set<string>();
 const nativeFetch = window.fetch.bind(window);
 const inflightRangeRequests = new Map<string, Promise<Response>>();
+const inflightCacheWrites = new Map<string, Promise<void>>();
+const inflightMediaResponses = new Map<string, Promise<CacheEntry | null>>();
 const activeMediaFetches = new Set<string>();
 const downloadSamples: DownloadSample[] = [];
 
@@ -192,6 +214,7 @@ let prefetchHitCount = 0;
 let rangeChunkRetryCount = 0;
 let lastMediaUrl: string | null = null;
 let lastLivePlaylistUrl: string | null = null;
+let lastLiveLeafPlaylistUrl: string | null = null;
 let lastLivePlaylistRefreshAt = 0;
 let inflightLivePlaylistRefresh: Promise<void> | null = null;
 let activeRangeChunkJobs = 0;
@@ -234,6 +257,7 @@ let seekState: SeekState = {
   targetTime: 0,
   targetBuffered: true,
   resolvedAt: null,
+  recoveryAnchorExpiresAt: null,
 };
 
 const state: PageStatus = buildStatus(
@@ -310,24 +334,30 @@ function installBridge(): void {
 
 function installFetchHook(): void {
   window.fetch = async (input, init) => {
-    const requestUrl = extractRequestUrl(input);
+    const requestSemantics = getRequestSemantics(input, init);
+    const requestUrl = requestSemantics.url;
     const resourceKind = classifyResource(requestUrl);
-    const cacheHit = takeCachedResponse(requestUrl);
+    const canUseFullBodyCache = shouldUseFullBodyCache(requestSemantics, resourceKind);
+    const drivesStreamingPipeline = shouldDriveStreamingPipeline(requestSemantics, resourceKind);
+    const cacheHit = canUseFullBodyCache ? takeCachedEntry(requestUrl) : null;
     if (cacheHit) {
       prefetchHitCount += 1;
       emitNetworkEvent("prefetch", requestUrl, 0, true, undefined, "cache-hit");
-      return cacheHit;
+      const response = responseFromCache(cacheHit);
+      scheduleAfterFullBodyCacheHit(requestUrl, resourceKind, cacheHit);
+      return response;
     }
 
-    const prefetched = await takeInflightPrefetch(requestUrl);
+    const prefetched = canUseFullBodyCache ? await takeInflightPrefetch(requestUrl) : null;
     if (prefetched) {
       prefetchHitCount += 1;
       emitNetworkEvent("prefetch", requestUrl, 0, true, prefetched.body.byteLength, "await-prefetch");
+      scheduleAfterFullBodyCacheHit(requestUrl, resourceKind, prefetched);
       return responseFromCache(prefetched);
     }
 
     const started = performance.now();
-    if (resourceKind === "media") {
+    if (resourceKind === "media" && drivesStreamingPipeline) {
       activeMediaFetches.add(requestUrl);
     }
     let response: Response;
@@ -335,7 +365,7 @@ function installFetchHook(): void {
     let usedSplitResponse = false;
     try {
       const splitResponse =
-        resourceKind === "media" ? await maybeServeMediaWithRangeSplit(requestUrl, input, init) : null;
+        resourceKind === "media" ? await maybeServeMediaWithRangeSplit(requestUrl, input, init, requestSemantics) : null;
       usedSplitResponse = Boolean(splitResponse);
       const resolved = splitResponse
         ? { response: splitResponse, finalUrl: requestUrl }
@@ -343,16 +373,20 @@ function installFetchHook(): void {
       response = resolved.response;
       finalUrl = resolved.finalUrl;
     } finally {
-      if (resourceKind === "media") {
+      if (resourceKind === "media" && drivesStreamingPipeline) {
         activeMediaFetches.delete(requestUrl);
       }
     }
     const responseForPage = await maybeRewriteFetchResponse(requestUrl, response);
     const durationMs = Math.round(performance.now() - started);
-    const clone = responseForPage.clone();
-    noteActiveMediaHost(finalUrl, resourceKind);
+    const clone = resourceKind === "playurl" || resourceKind === "livePlayInfo" || resourceKind === "playlist"
+      ? responseForPage.clone()
+      : null;
+    if (drivesStreamingPipeline || resourceKind === "playurl" || resourceKind === "livePlayInfo") {
+      noteActiveMediaHost(finalUrl, resourceKind);
+    }
     noteHostSuccess(finalUrl, durationMs);
-    if (resourceKind === "media" && !usedSplitResponse) {
+    if (resourceKind === "media" && drivesStreamingPipeline && !usedSplitResponse) {
       const sampleBytes = Number(responseForPage.headers.get("content-length") ?? "0");
       recordDownloadSample({
         ts: Date.now(),
@@ -362,15 +396,15 @@ function installFetchHook(): void {
         durationMs,
       });
     }
-    if (resourceKind === "media" && responseForPage.ok) {
+    if (canUseFullBodyCache && resourceKind === "media" && responseForPage.ok) {
       void storeFetchedMediaResponse(finalUrl, responseForPage.clone());
     }
-    void handleFetchResponse(finalUrl, resourceKind, clone, durationMs);
+    void handleFetchResponse(finalUrl, resourceKind, clone ?? responseForPage, durationMs);
 
-    if (resourceKind === "media" && responseForPage.ok) {
+    if (resourceKind === "media" && drivesStreamingPipeline && responseForPage.ok) {
       noteSegmentDuration(durationMs);
       scheduleVodPrefetch(finalUrl);
-    } else if (resourceKind === "playlist" && responseForPage.ok) {
+    } else if (resourceKind === "playlist" && drivesStreamingPipeline && responseForPage.ok) {
       void scheduleLivePlaylistPrefetch(finalUrl, responseForPage.clone());
     }
     return responseForPage;
@@ -549,7 +583,7 @@ function patchSourceBuffer(buffer: SourceBuffer, mimeType: string): void {
 
 async function handleFetchResponse(
   url: string,
-  resourceKind: ReturnType<typeof classifyResource>,
+  resourceKind: ResourceKind,
   response: Response,
   durationMs: number,
 ): Promise<void> {
@@ -567,8 +601,6 @@ async function handleFetchResponse(
     if (json) {
       handleLivePlayInfo(json);
     }
-  } else if (resourceKind === "media" && response.ok) {
-    await storeFetchedMediaResponse(url, response);
   }
 }
 
@@ -726,8 +758,14 @@ function maybeRecover(reason: string, video: HTMLVideoElement): void {
   if (state.mode === "off") {
     return;
   }
+  if (seekState.active) {
+    emitControl("recovery-suppressed-during-seek", `${reason}:${seekState.targetTime.toFixed(2)}s`);
+    scheduleSeekPrefetch();
+    return;
+  }
   const now = Date.now();
-  if (now - (recoveryTimestamps.get(reason) ?? 0) < RECOVERY_LIMITS.sameActionCooldownMs) {
+  const recoveryKey = reason === "waiting" || reason === "stalled" ? "buffer-starved" : reason;
+  if (now - (recoveryTimestamps.get(recoveryKey) ?? 0) < RECOVERY_LIMITS.sameActionCooldownMs) {
     return;
   }
 
@@ -740,12 +778,13 @@ function maybeRecover(reason: string, video: HTMLVideoElement): void {
     enableProtocolFallback: policy.live.enableProtocolFallback,
     hostFailures: recentHostFailures(),
     repeatedStalls: state.waitingCount1m + state.stalledCount1m,
+    seekInProgress: seekState.active,
   });
   if (action === "noop") {
     return;
   }
 
-  recoveryTimestamps.set(reason, now);
+  recoveryTimestamps.set(recoveryKey, now);
   void executeRecovery(action, video);
   state.lastRecoveryReason = reason;
   state.lastRecoveryAction = action;
@@ -764,6 +803,7 @@ function maybeRecover(reason: string, video: HTMLVideoElement): void {
 }
 
 async function executeRecovery(action: string, video: HTMLVideoElement): Promise<void> {
+  const restoreTarget = resolveRecoveryTargetTime(video);
   switch (action) {
     case "switch-live-protocol": {
       requestPolicyPatch({
@@ -772,7 +812,7 @@ async function executeRecovery(action: string, video: HTMLVideoElement): Promise
         },
       });
       attemptPlayerMethod(["reload", "restart", "replay"]);
-      softSeek(video);
+      restorePlaybackPosition(video, restoreTarget);
       await ensurePlayback(video);
       return;
     }
@@ -786,6 +826,7 @@ async function executeRecovery(action: string, video: HTMLVideoElement): Promise
       if (state.quality != null && currentQuality !== state.quality) {
         attemptPlayerMethod(["requestQuality", "setQuality"], state.quality);
       }
+      restorePlaybackPosition(video, restoreTarget);
       await ensurePlayback(video);
       return;
     }
@@ -807,6 +848,7 @@ async function executeRecovery(action: string, video: HTMLVideoElement): Promise
           attemptPlayerMethod(["requestQuality", "setQuality", "switchQuality"], nextQuality);
         }
       }
+      restorePlaybackPosition(video, restoreTarget);
       await ensurePlayback(video);
       return;
     }
@@ -814,9 +856,35 @@ async function executeRecovery(action: string, video: HTMLVideoElement): Promise
     case "rebuild-playback-state":
     default: {
       attemptPlayerMethod(["reload", "restart", "replay"]);
-      softSeek(video);
+      restorePlaybackPosition(video, restoreTarget);
       await ensurePlayback(video);
     }
+  }
+}
+
+function resolveRecoveryTargetTime(video: HTMLVideoElement): number | null {
+  if (seekState.active && Number.isFinite(seekState.targetTime)) {
+    return seekState.targetTime;
+  }
+  if (
+    seekState.recoveryAnchorExpiresAt != null &&
+    performance.now() <= seekState.recoveryAnchorExpiresAt &&
+    Number.isFinite(seekState.targetTime)
+  ) {
+    return seekState.targetTime;
+  }
+  return Number.isFinite(video.currentTime) ? video.currentTime : null;
+}
+
+function restorePlaybackPosition(video: HTMLVideoElement, targetTime: number | null): void {
+  if (targetTime == null || !Number.isFinite(targetTime)) {
+    softSeek(video);
+    return;
+  }
+  try {
+    video.currentTime = Math.max(0, targetTime);
+  } catch {
+    softSeek(video);
   }
 }
 
@@ -895,9 +963,10 @@ function publishStatus(): void {
 
 function updateDerivedMetrics(): void {
   refreshDownloadController();
+  const durationSamples = pageKind === "live" && liveSegmentDurations.length > 0 ? liveSegmentDurations : segmentDurations;
   state.avgSegmentDurationMs =
-    segmentDurations.length > 0
-      ? Math.round(segmentDurations.reduce((sum, value) => sum + value, 0) / segmentDurations.length)
+    durationSamples.length > 0
+      ? Math.round(durationSamples.reduce((sum, value) => sum + value, 0) / durationSamples.length)
       : 0;
   state.prefetchQueueDepth = prefetchQueue.length + inflightPrefetches.size;
   state.cacheBytes = cacheBytes;
@@ -1075,7 +1144,8 @@ function refreshDownloadController(force = false): void {
   const activeSegmentDownloads = prefetchActive + inflightRangeRequests.size;
   const queueDepth = prefetchQueue.length + activeSegmentDownloads;
   const base = resolveControllerBaseline(phase);
-  const decision = resolveControllerDecision({
+  const decision = resolveDownloadController({
+    phase,
     minConcurrency: base.minConcurrency,
     maxConcurrency: Math.min(policy.vod.maxConcurrentRequests, base.maxConcurrency),
     currentConcurrency: downloadController.controllerAppliedConcurrency,
@@ -1161,81 +1231,19 @@ function resolveControllerBaseline(phase: DownloadPhase): { minConcurrency: numb
   return { minConcurrency: 8, maxConcurrency: 16, startConcurrency: 10 };
 }
 
-function resolveControllerDecision(input: {
-  minConcurrency: number;
-  maxConcurrency: number;
-  currentConcurrency: number;
-  previousThroughputBps: number;
-  recentThroughputBps: number;
-  recentErrorRate: number;
-  queueDepth: number;
-  lowGainStreak: number;
-  bufferedSeconds: number;
-  targetBufferSeconds: number;
-  seekUrgent: boolean;
-  liveUrgent: boolean;
-  cacheSatisfied: boolean;
-}): { nextConcurrency: number; nextLowGainStreak: number } {
-  if (input.seekUrgent || input.liveUrgent) {
-    return {
-      nextConcurrency: input.maxConcurrency,
-      nextLowGainStreak: 0,
-    };
-  }
-  if (input.queueDepth <= 0) {
-    if (input.bufferedSeconds > input.targetBufferSeconds + 8 && input.cacheSatisfied) {
-      return {
-        nextConcurrency: input.minConcurrency,
-        nextLowGainStreak: 0,
-      };
-    }
-    return {
-      nextConcurrency: clampNumber(input.currentConcurrency, input.minConcurrency, input.maxConcurrency),
-      nextLowGainStreak: 0,
-    };
-  }
-  const throughputGain =
-    input.previousThroughputBps > 0
-      ? (input.recentThroughputBps - input.previousThroughputBps) / input.previousThroughputBps
-      : input.recentThroughputBps > 0
-        ? 1
-        : 0;
-  if (input.recentErrorRate >= 0.05) {
-    return {
-      nextConcurrency: clampNumber(input.currentConcurrency - 2, input.minConcurrency, input.maxConcurrency),
-      nextLowGainStreak: 0,
-    };
-  }
-  if (throughputGain >= 0.08 && input.recentErrorRate < 0.03) {
-    return {
-      nextConcurrency: clampNumber(input.currentConcurrency + 2, input.minConcurrency, input.maxConcurrency),
-      nextLowGainStreak: 0,
-    };
-  }
-  const nextLowGainStreak = Math.abs(throughputGain) < 0.03 ? input.lowGainStreak + 1 : 0;
-  if (nextLowGainStreak >= 3) {
-    return {
-      nextConcurrency: clampNumber(input.currentConcurrency - 2, input.minConcurrency, input.maxConcurrency),
-      nextLowGainStreak: 0,
-    };
-  }
-  if (input.bufferedSeconds > input.targetBufferSeconds + 8 && input.cacheSatisfied) {
-    return {
-      nextConcurrency: input.minConcurrency,
-      nextLowGainStreak: 0,
-    };
-  }
-  return {
-    nextConcurrency: clampNumber(input.currentConcurrency, input.minConcurrency, input.maxConcurrency),
-    nextLowGainStreak,
-  };
-}
-
 function resolveAvgVodSegmentSeconds(): number {
   return clampNumber(downloadController.avgVodSegmentSeconds || 4, 1, 8);
 }
 
 function resolveCacheTargetBytes(phase: DownloadPhase, windowSeconds: number): number {
+  if (pageKind === "live" || phase === "liveUrgent") {
+    return resolveLiveCacheTargetBytes({
+      targetBufferSeconds: windowSeconds,
+      avgSegmentSeconds: state.avgSegmentDurationMs > 0 ? state.avgSegmentDurationMs / 1000 : null,
+      recentBytesPerRequest: downloadController.recentBytesPerRequest,
+      quality: state.quality,
+    });
+  }
   const bitrateEstimate = Math.max(2_500_000, vodSelection.bitrate ?? 5_000_000);
   const highBitrateMode = (state.quality ?? 0) >= 1440 || bitrateEstimate >= 8_000_000;
   const multiplier = phase === "seek" ? 2.1 : phase === "initial" ? 1.9 : 1.6;
@@ -1244,22 +1252,6 @@ function resolveCacheTargetBytes(phase: DownloadPhase, windowSeconds: number): n
     highBitrateMode ? 256 * 1024 * 1024 : 128 * 1024 * 1024,
     1024 * 1024 * 1024,
   );
-}
-
-function classifyResource(url: string): "playurl" | "livePlayInfo" | "media" | "playlist" | "other" {
-  if (/x\/player\/wbi\/playurl/.test(url)) {
-    return "playurl";
-  }
-  if (/xlive\/web-room\/v2\/index\/getRoomPlayInfo/.test(url)) {
-    return "livePlayInfo";
-  }
-  if (/\.m3u8(\?|$)/.test(url)) {
-    return "playlist";
-  }
-  if (/\.m4s(\?|$)|\.mp4(\?|$)|\.flv(\?|$)|\.ts(\?|$)|\.cmfv(\?|$)/.test(url)) {
-    return "media";
-  }
-  return "other";
 }
 
 async function maybeRewriteFetchResponse(url: string, response: Response): Promise<Response> {
@@ -1444,15 +1436,36 @@ async function scheduleLivePlaylistPrefetch(playlistUrl: string, response: Respo
     return;
   }
 
-  const urls = parsePlaylistUrls(playlistUrl, text);
-  const liveWindow = resolveLivePrefetchWindow(urls.length);
+  const items = parseLivePlaylistItems(playlistUrl, text);
+  noteLivePlaylistDurations(items.map((item) => item.durationSeconds).filter((item): item is number => item != null));
+  const mediaItems = items.filter((item) => item.kind === "media");
+  const playlistItems = items.filter((item) => item.kind === "playlist");
+  if (playlistItems.length > 0) {
+    lastLiveLeafPlaylistUrl = null;
+  }
+  if (playlistItems.length === 0 && mediaItems.length > 0) {
+    lastLiveLeafPlaylistUrl = playlistUrl;
+  }
+  const liveWindow = resolveLivePrefetchWindow({
+    totalSegments: mediaItems.length,
+    bufferedSeconds: state.bufferedSeconds,
+    targetBufferSeconds: policy.live.stableBufferTargetSeconds,
+    avgSegmentSeconds: state.avgSegmentDurationMs > 0 ? state.avgSegmentDurationMs / 1000 : null,
+  });
   const urgent = state.bufferedSeconds < 1.5;
-  for (const url of urls.slice(0, liveWindow)) {
-    if (liveSeenSegments.has(url)) {
+  for (const item of playlistItems) {
+    if (liveSeenSegments.has(item.url)) {
       continue;
     }
-    liveSeenSegments.add(url);
-    queuePrefetch({ url, kind: "media", priority: urgent ? "seek" : "playlist" });
+    liveSeenSegments.add(item.url);
+    queuePrefetch({ url: item.url, kind: "playlist", priority: "playlist" });
+  }
+  for (const item of mediaItems.slice(0, liveWindow)) {
+    if (liveSeenSegments.has(item.url)) {
+      continue;
+    }
+    liveSeenSegments.add(item.url);
+    queuePrefetch({ url: item.url, kind: "media", priority: urgent ? "seek" : "playlist" });
   }
 
   while (liveSeenSegments.size > 64) {
@@ -1465,7 +1478,8 @@ async function scheduleLivePlaylistPrefetch(playlistUrl: string, response: Respo
 }
 
 async function maybeRefreshLivePlaylist(force = false): Promise<void> {
-  if (pageKind !== "live" || state.mode === "off" || !lastLivePlaylistUrl) {
+  const playlistUrl = lastLiveLeafPlaylistUrl ?? lastLivePlaylistUrl;
+  if (pageKind !== "live" || state.mode === "off" || !playlistUrl) {
     return;
   }
   if (inflightLivePlaylistRefresh) {
@@ -1484,14 +1498,15 @@ async function maybeRefreshLivePlaylist(force = false): Promise<void> {
     return;
   }
   lastLivePlaylistRefreshAt = now;
-
-  const playlistUrl = lastLivePlaylistUrl;
   inflightLivePlaylistRefresh = (async () => {
     const started = performance.now();
     const response = await nativeFetch(playlistUrl, { cache: "no-store", credentials: "include" }).catch(() => null);
     const durationMs = Math.round(performance.now() - started);
     if (!response?.ok) {
       noteHostFailure(playlistUrl);
+      if (playlistUrl === lastLiveLeafPlaylistUrl) {
+        lastLiveLeafPlaylistUrl = null;
+      }
       emitNetworkEvent("playlist", playlistUrl, durationMs, false, undefined, "background-refresh");
       return;
     }
@@ -1718,10 +1733,14 @@ async function runPrefetch(task: PrefetchTask): Promise<CacheEntry | null> {
   };
   storeCacheEntry(entry);
   emitNetworkEvent("prefetch", task.url, durationMs, true, body.byteLength, task.priority);
-  noteSegmentDuration(durationMs);
-  if (pageKind === "vod") {
+  if (task.kind === "playlist") {
+    await scheduleLivePlaylistPrefetch(task.url, responseFromCache(entry).clone());
+  } else {
+    noteSegmentDuration(durationMs);
+  }
+  if (pageKind === "vod" && task.kind === "media") {
     scheduleVodPrefetch(task.url);
-  } else if (pageKind === "live" && document.hidden) {
+  } else if (pageKind === "live" && task.kind === "media" && document.hidden) {
     void maybeRefreshLivePlaylist();
   }
   return entry;
@@ -1763,11 +1782,12 @@ async function downloadPrefetchByRange(task: PrefetchTask): Promise<CacheEntry |
 }
 
 async function probeRangeSupport(url: string, init?: RequestInit): Promise<{ contentLength: number; headers: Headers } | null> {
+  const headers = cloneRequestHeaders(init?.headers);
   const head = await nativeFetch(url, {
     method: "HEAD",
     cache: "no-store",
     credentials: "include",
-    headers: cloneRequestHeaders(init?.headers),
+    headers,
   }).catch(() => null);
   if (!head?.ok) {
     return null;
@@ -1780,7 +1800,7 @@ async function probeRangeSupport(url: string, init?: RequestInit): Promise<{ con
   return { contentLength, headers: cloneHeaders(head.headers) };
 }
 
-function takeCachedResponse(url: string): Response | null {
+function takeCachedEntry(url: string): CacheEntry | null {
   const entry = mediaCache.get(url);
   if (!entry) {
     return null;
@@ -1788,7 +1808,7 @@ function takeCachedResponse(url: string): Response | null {
   mediaCache.delete(url);
   cacheBytes = Math.max(0, cacheBytes - entry.bytes);
   updateDerivedMetrics();
-  return responseFromCache(entry);
+  return entry;
 }
 
 async function takeInflightPrefetch(url: string): Promise<CacheEntry | null> {
@@ -1807,38 +1827,93 @@ function responseFromCache(entry: CacheEntry): Response {
   });
 }
 
+function scheduleAfterFullBodyCacheHit(url: string, resourceKind: ResourceKind, entry: CacheEntry): void {
+  if (resourceKind === "media") {
+    if (pageKind === "vod") {
+      const nextSeedUrl = resolveNextVodSeedUrl(url, entry);
+      if (nextSeedUrl && nextSeedUrl !== url) {
+        scheduleVodPrefetch(nextSeedUrl);
+      }
+    } else if (pageKind === "live") {
+      void maybeRefreshLivePlaylist();
+    }
+    return;
+  }
+  if (resourceKind === "playlist") {
+    void scheduleLivePlaylistPrefetch(url, responseFromCache(entry).clone());
+  }
+}
+
+function resolveNextVodSeedUrl(url: string, entry: CacheEntry): string {
+  const sequence = extractUrlSequence(url);
+  if (sequence != null) {
+    return replaceUrlSequence(url, sequence + 1) ?? url;
+  }
+  const headerBase = new Headers(entry.headers).get("x-next-segment-url") ?? new Headers(entry.headers).get("x-bwf-next-segment-url");
+  if (headerBase) {
+    return headerBase;
+  }
+  return "";
+}
+
 async function storeFetchedMediaResponse(url: string, response: Response): Promise<void> {
   if (mediaCache.has(url)) {
     return;
   }
-  const body = await response.arrayBuffer().catch(() => null);
-  if (!body) {
+  const existingWrite = inflightCacheWrites.get(url);
+  if (existingWrite) {
+    await existingWrite;
     return;
   }
-  storeCacheEntry({
-    url,
-    body,
-    status: response.status,
-    statusText: response.statusText,
-    headers: [...response.headers.entries()],
-    bytes: body.byteLength,
-    createdAt: Date.now(),
-    source: "prefetch",
+
+  let inflightEntry = inflightMediaResponses.get(url);
+  if (!inflightEntry) {
+    inflightEntry = (async () => {
+      const body = await response.arrayBuffer().catch(() => null);
+      if (!body) {
+        return null;
+      }
+      return {
+        url,
+        body,
+        status: response.status,
+        statusText: response.statusText,
+        headers: [...response.headers.entries()],
+        bytes: body.byteLength,
+        createdAt: Date.now(),
+        source: "prefetch" as const,
+      };
+    })().finally(() => {
+      inflightMediaResponses.delete(url);
+    });
+    inflightMediaResponses.set(url, inflightEntry);
+  }
+
+  const write = inflightEntry.then((entry) => {
+    if (!entry || mediaCache.has(url)) {
+      return;
+    }
+    storeCacheEntry(entry);
+  }).finally(() => {
+    inflightCacheWrites.delete(url);
   });
+  inflightCacheWrites.set(url, write);
+  await write;
 }
 
 async function maybeServeMediaWithRangeSplit(
   url: string,
   input: RequestInfo | URL,
   init: RequestInit | undefined,
+  semantics: RequestSemantics,
 ): Promise<Response | null> {
-  if (!shouldUseRangeSplit(url, init)) {
+  if (!shouldUseRangeSplit(url, semantics)) {
     return null;
   }
   const cacheKey = `${url}::seek=${seekState.active && !seekState.targetBuffered ? "1" : "0"}`;
   const inflight = inflightRangeRequests.get(cacheKey);
   if (inflight) {
-    return inflight;
+    return inflight.then((response) => (response.ok && response.status === 200 ? response : null));
   }
   const promise = runRangeSplitRequest(url, input, init)
     .catch(() => null)
@@ -1852,26 +1927,31 @@ async function maybeServeMediaWithRangeSplit(
   return response;
 }
 
-function shouldUseRangeSplit(url: string, init: RequestInit | undefined): boolean {
-  if (pageKind !== "vod" || state.mode === "off" || !policy.vod.experimentalRangeSplit) {
-    return false;
-  }
-  if (!/\.m4s(\?|$)|\.mp4(\?|$)|\.cmfv(\?|$)/.test(url)) {
-    return false;
-  }
-  const method = init?.method?.toUpperCase();
-  if (method && method !== "GET") {
-    return false;
-  }
-  return !((init?.headers instanceof Headers && init.headers.has("range")) || hasRangeHeader(init?.headers));
+function shouldUseRangeSplit(url: string, semantics: RequestSemantics): boolean {
+  return shouldUseRangeSplitForRequest({
+    pageKind,
+    mode: state.mode,
+    experimentalRangeSplit: policy.vod.experimentalRangeSplit,
+    url,
+    semantics,
+  });
 }
 
 async function runRangeSplitRequest(
   url: string,
-  _input: RequestInfo | URL,
+  input: RequestInfo | URL,
   init: RequestInit | undefined,
 ): Promise<Response | null> {
-  const probe = await probeRangeSupport(url, init);
+  const requestHeaders = cloneRequestHeaders(init?.headers);
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    input.headers.forEach((value, key) => {
+      if (!requestHeaders.has(key)) {
+        requestHeaders.set(key, value);
+      }
+    });
+  }
+  const rangeInit = { ...init, headers: requestHeaders };
+  const probe = await probeRangeSupport(url, rangeInit);
   if (!probe) {
     return null;
   }
@@ -1889,7 +1969,7 @@ async function runRangeSplitRequest(
   }
 
   const concurrency = resolveRangeSplitConcurrency(tasks[0]?.reason ?? "playback");
-  const buffers = await runRangeChunkTasks(tasks, init, concurrency);
+  const buffers = await runRangeChunkTasks(tasks, rangeInit, concurrency);
   if (buffers.some((buffer) => buffer == null)) {
     return null;
   }
@@ -2005,13 +2085,6 @@ function cloneRequestHeaders(headers: HeadersInit | undefined): Headers {
   return next;
 }
 
-function hasRangeHeader(headers: HeadersInit | undefined): boolean {
-  if (!headers) {
-    return false;
-  }
-  return new Headers(headers).has("range");
-}
-
 function storeCacheEntry(entry: CacheEntry): void {
   if (mediaCache.has(entry.url)) {
     const previous = mediaCache.get(entry.url);
@@ -2044,7 +2117,7 @@ async function performFetchWithFallback(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
   _originalUrl: string,
-  resourceKind: ReturnType<typeof classifyResource>,
+  resourceKind: ResourceKind,
 ): Promise<{ response: Response; finalUrl: string }> {
   const firstUrl = extractRequestUrl(input);
   try {
@@ -2149,7 +2222,7 @@ function trimHostFailureSamples(now: number, windowMs = 90_000): void {
   }
 }
 
-function noteActiveMediaHost(url: string, resourceKind: ReturnType<typeof classifyResource>): void {
+function noteActiveMediaHost(url: string, resourceKind: ResourceKind): void {
   if (resourceKind !== "media" && resourceKind !== "playlist") {
     return;
   }
@@ -2203,22 +2276,6 @@ function inferVodTrack(url: string): "audio" | "video" {
     return "audio";
   }
   return "video";
-}
-
-function parsePlaylistUrls(baseUrl: string, text: string): string[] {
-  const results: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      const mapMatch = trimmed.match(/URI="([^"]+)"/);
-      if (mapMatch?.[1]) {
-        results.push(new URL(mapMatch[1], baseUrl).toString());
-      }
-      continue;
-    }
-    results.push(new URL(trimmed, baseUrl).toString());
-  }
-  return results;
 }
 
 function currentReadyState(): number {
@@ -2375,6 +2432,18 @@ function noteSegmentDuration(durationMs: number): void {
   }
 }
 
+function noteLivePlaylistDurations(durationsSeconds: number[]): void {
+  for (const durationSeconds of durationsSeconds) {
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      continue;
+    }
+    liveSegmentDurations.push(durationSeconds * 1000);
+  }
+  while (liveSegmentDurations.length > 48) {
+    liveSegmentDurations.shift();
+  }
+}
+
 function beginSeekTracking(video: HTMLVideoElement): void {
   const targetBuffered = isTimeBuffered(video, video.currentTime);
   seekState = {
@@ -2383,11 +2452,14 @@ function beginSeekTracking(video: HTMLVideoElement): void {
     targetTime: video.currentTime,
     targetBuffered,
     resolvedAt: null,
+    recoveryAnchorExpiresAt: null,
   };
   state.lastSeekTargetBuffered = targetBuffered;
   state.seekInProgress = true;
+  refreshDownloadController(true);
   if (!targetBuffered) {
     emitControl("seek-uncached", `${video.currentTime.toFixed(2)}s`);
+    scheduleSeekPrefetch();
   }
 }
 
@@ -2395,21 +2467,36 @@ function resolveSeekTracking(video: HTMLVideoElement, reason: string): void {
   if (!seekState.active) {
     return;
   }
-  const targetBuffered = isTimeBuffered(video, video.currentTime);
-  if (!targetBuffered && reason !== "seeked") {
+  const targetBuffered = isTimeBuffered(video, seekState.targetTime);
+  if (!targetBuffered) {
+    state.lastSeekTargetBuffered = false;
+    state.seekInProgress = true;
+    scheduleSeekPrefetch();
     return;
   }
   const recoveryMs = Math.round(performance.now() - seekState.startedAt);
+  const recoveryAnchorExpiresAt = performance.now() + 750;
   seekState = {
     ...seekState,
     active: false,
     targetBuffered,
     resolvedAt: performance.now(),
+    recoveryAnchorExpiresAt,
   };
   state.lastSeekRecoveryMs = recoveryMs;
   state.lastSeekTargetBuffered = targetBuffered;
   state.seekInProgress = false;
   emitControl("seek-recovered", `${recoveryMs}ms:${reason}`);
+}
+
+function scheduleSeekPrefetch(): void {
+  if (pageKind !== "vod") {
+    return;
+  }
+  const seedUrl = lastMediaUrl ?? vodSelection.videoBaseUrl ?? vodSelection.audioBaseUrl;
+  if (seedUrl) {
+    scheduleVodPrefetch(seedUrl);
+  }
 }
 
 function isTimeBuffered(video: HTMLVideoElement, time: number): boolean {
@@ -2462,20 +2549,6 @@ function classifyLiveBufferTier(bufferedSeconds: number): "low" | "target" | "hi
     return "high";
   }
   return "target";
-}
-
-function resolveLivePrefetchWindow(totalSegments: number): number {
-  if (totalSegments <= 0) {
-    return 0;
-  }
-  if (state.bufferedSeconds < 1.5) {
-    return totalSegments;
-  }
-  const target = Math.max(3, policy.live.stableBufferTargetSeconds);
-  const avgSegmentSeconds = Math.max(1, state.avgSegmentDurationMs / 1000 || 2);
-  const desired = Math.ceil(target / avgSegmentSeconds);
-  const aggressiveFloor = state.bufferedSeconds < target ? desired + 2 : desired;
-  return Math.min(totalSegments, Math.max(3, Math.min(8, aggressiveFloor)));
 }
 
 function overlayButtonStyle(): string {
@@ -2693,124 +2766,6 @@ function codecPriority(codecs: string, order: string[]): number {
   const lower = codecs.toLowerCase();
   const idx = order.findIndex((item) => lower.includes(item));
   return idx === -1 ? Number.MAX_SAFE_INTEGER : idx;
-}
-
-function sortLiveCandidates<T extends { protocolName: string; formatName: string; codecName: string }>(
-  mode: PlaybackMode,
-  candidates: T[],
-): T[] {
-  const stableOrder = ["fmp4", "flv", "ts"];
-  const lowLatencyOrder = ["flv", "fmp4", "ts"];
-  const chosen = mode === "lowLatency" ? lowLatencyOrder : stableOrder;
-
-  return [...candidates].sort((a, b) => {
-    const ap = chosen.findIndex((item) => item === a.formatName);
-    const bp = chosen.findIndex((item) => item === b.formatName);
-    const normalizedAp = ap === -1 ? Number.MAX_SAFE_INTEGER : ap;
-    const normalizedBp = bp === -1 ? Number.MAX_SAFE_INTEGER : bp;
-    if (normalizedAp !== normalizedBp) {
-      return normalizedAp - normalizedBp;
-    }
-    return liveCodecScore(b.codecName) - liveCodecScore(a.codecName);
-  });
-}
-
-function liveCodecScore(codecName: string): number {
-  const lower = codecName.toLowerCase();
-  if (lower.includes("avc")) {
-    return 3;
-  }
-  if (lower.includes("hevc") || lower.includes("hev")) {
-    return 2;
-  }
-  if (lower.includes("av1")) {
-    return 1;
-  }
-  return 0;
-}
-
-function resolvePrefetchDecision(input: {
-  preferredWindow: number;
-  aggressivePrefetchSeconds: number;
-  maxConcurrentRequests: number;
-  quality: number | null;
-  estimatedBitrate: number | null;
-  avgSegmentDurationMs?: number | null;
-  phase?: VodPrefetchPhase;
-  remainingSeconds?: number | null;
-}) {
-  const highBitrateMode = (input.quality ?? 0) >= 1440 || (input.estimatedBitrate ?? 0) >= 8_000_000;
-  const phase = input.phase ?? "steady";
-  const baseWindow = 12;
-  const configuredTargetSeconds = 48;
-  const remainingSeconds = Number.isFinite(input.remainingSeconds ?? NaN)
-    ? Math.max(0, input.remainingSeconds ?? 0)
-    : null;
-  const targetSeconds =
-    remainingSeconds != null && remainingSeconds > 0
-      ? Math.min(configuredTargetSeconds, remainingSeconds)
-      : configuredTargetSeconds;
-  const cacheEntireRemaining = remainingSeconds != null && remainingSeconds <= configuredTargetSeconds;
-  const avgSegmentSeconds = Math.max(1, (input.avgSegmentDurationMs ?? 4000) / 1000);
-  const futureSegments = Math.max(1, Math.ceil(targetSeconds / avgSegmentSeconds));
-  const phaseBoost = phase === "seek" ? 6 : phase === "initial" ? 3 : 0;
-  const videoWindow = cacheEntireRemaining
-    ? futureSegments
-    : Math.min(phase === "seek" ? 30 : phase === "initial" ? 24 : 18, Math.max(baseWindow, futureSegments + phaseBoost));
-  const audioWindow = cacheEntireRemaining ? videoWindow : Math.min(18, Math.max(4, videoWindow));
-  const totalConcurrency = Math.min(
-    16,
-    Math.max(
-      8,
-      Math.max(input.maxConcurrentRequests, phase === "seek" ? 16 : phase === "initial" ? 14 : Math.min(videoWindow + 2, 12)),
-    ),
-  );
-  const bitrateEstimate = Math.max(
-    2_500_000,
-    input.estimatedBitrate ?? (highBitrateMode ? 12_000_000 : 5_000_000),
-  );
-  const multiplier = phase === "seek" ? 2.1 : phase === "initial" ? 1.9 : 1.6;
-  const cacheLimitBytes = clampNumber(
-    Math.round((bitrateEstimate / 8) * Math.max(targetSeconds, 12) * multiplier),
-    highBitrateMode ? 256 * 1024 * 1024 : 128 * 1024 * 1024,
-    1024 * 1024 * 1024,
-  );
-  return {
-    videoWindow,
-    audioWindow,
-    totalConcurrency,
-    cacheLimitBytes,
-    targetSeconds,
-    highBitrateMode,
-  };
-}
-
-function selectRecoveryAction(input: {
-  pageKind: "vod" | "live" | "unknown";
-  mode: PlaybackMode;
-  bufferedSeconds: number;
-  droppedFrames: number;
-  backupHostsAvailable: boolean;
-  enableProtocolFallback: boolean;
-  hostFailures: number;
-  repeatedStalls: number;
-}): string {
-  if (input.mode === "off") {
-    return "noop";
-  }
-  if (input.bufferedSeconds < 1.25) {
-    return input.pageKind === "live" ? "rebuild-live-player" : "rebuild-playback-state";
-  }
-  if (input.pageKind === "live" && input.enableProtocolFallback && input.repeatedStalls >= 2) {
-    return "switch-live-protocol";
-  }
-  if (input.droppedFrames >= 12) {
-    return "prefer-stable-codec";
-  }
-  if (input.hostFailures >= 2) {
-    return "drop-quality";
-  }
-  return input.pageKind === "live" ? "rebuild-live-player" : "rebuild-playback-state";
 }
 
 function clampNumber(value: number, min: number, max: number): number {

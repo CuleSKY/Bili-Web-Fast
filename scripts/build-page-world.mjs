@@ -1,30 +1,37 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import ts from "typescript";
+import { build } from "vite";
 
 const root = process.cwd();
 const sourcePath = path.join(root, "src", "page", "index.ts");
 const outputDir = path.join(root, "src", "generated");
 const outputPath = path.join(outputDir, "page-world.js");
 
-const source = await fs.readFile(sourcePath, "utf8");
-const sanitizedSource = source
-  .replace(/^import type[\s\S]*?from\s+["'][^"']+["'];\r?\n/gm, "")
-  .replace(/^export\s+\{\};\r?\n/gm, "");
-
-const transpiled = ts.transpileModule(sanitizedSource, {
-  compilerOptions: {
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.None,
-    lib: ["ES2022", "DOM"],
-    removeComments: false,
+const result = await build({
+  configFile: false,
+  publicDir: false,
+  logLevel: "silent",
+  build: {
+    write: false,
+    target: "es2022",
+    minify: false,
+    lib: {
+      entry: sourcePath,
+      name: "BwfPageWorld",
+      formats: ["iife"],
+      fileName: () => "page-world.js",
+    },
+    rollupOptions: {
+      output: {
+        inlineDynamicImports: true,
+      },
+    },
   },
-  fileName: "index.ts",
 });
 
-const outputText = transpiled.outputText
-  .replace(/^\s*Object\.defineProperty\(exports,\s*["']__esModule["'],\s*\{\s*value:\s*true\s*\}\);\r?\n/m, "")
-  .replace(/^"use strict";\r?\n/m, `"use strict";\n`);
+const outputs = Array.isArray(result) ? result.flatMap((item) => item.output) : result.output;
+const chunk = outputs.find((item) => item.type === "chunk");
+const outputText = chunk?.type === "chunk" ? chunk.code : "";
 
 await fs.mkdir(outputDir, { recursive: true });
 await fs.writeFile(
