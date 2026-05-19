@@ -1,0 +1,37 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+dist-extension/
+playwright-report/
+coverage/
+vite.svg
+
+# test artifacts
+test-results/
+.last-run.json
+
+# browser / automation profiles
+.chrome-cdp-profile/
+.chrome-cdp-profile-log/
+.chrome-real-profile/
+.playwright-chromium/
+.playwright-chromium-debug/
+.playwright-chromium-debug2/
+.pw-real-profile/
+.pw-real-profile-debug/
+
+# logs
+*.log
+
+# local config
+.env
+.env.*
+!.env.example
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

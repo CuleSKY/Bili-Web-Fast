@@ -1,0 +1,27 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", "PingFang SC", sans-serif;
+  background: #111318;
+  color: #eef2ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+  background: #111318;
+  color: #eef2ff;
+}
+
+button,
+select,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
