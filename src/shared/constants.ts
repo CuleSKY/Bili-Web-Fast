@@ -15,7 +15,7 @@ export const DEFAULT_POLICY: ExtensionPolicy = {
     codecPreference: "auto",
     prefetchWindow: 12,
     aggressivePrefetchSeconds: 48,
-    maxConcurrentRequests: 12,
+    maxConcurrentRequests: 24,
     experimentalRangeSplit: false,
     rangeChunkSizeKb: 2048,
     seekBoostWindow: 12,

@@ -17,7 +17,7 @@ describe("resolvePrefetchDecision", () => {
     expect(decision.audioWindow).toBe(15);
     expect(decision.totalConcurrency).toBe(14);
     expect(decision.targetSeconds).toBe(48);
-    expect(decision.cacheLimitBytes).toBeGreaterThanOrEqual(96 * 1024 * 1024);
+    expect(decision.cacheLimitBytes).toBeGreaterThanOrEqual(128 * 1024 * 1024);
     expect(decision.highBitrateMode).toBe(false);
   });
 
@@ -54,7 +54,7 @@ describe("resolvePrefetchDecision", () => {
     expect(decision.audioWindow).toBe(18);
     expect(decision.totalConcurrency).toBe(16);
     expect(decision.targetSeconds).toBe(48);
-    expect(decision.cacheLimitBytes).toBeGreaterThanOrEqual(192 * 1024 * 1024);
+    expect(decision.cacheLimitBytes).toBeGreaterThanOrEqual(256 * 1024 * 1024);
     expect(decision.highBitrateMode).toBe(true);
   });
 });

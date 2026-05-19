@@ -25,7 +25,7 @@ export function resolvePrefetchDecision(input: PrefetchDecisionInput): PrefetchD
     (input.quality ?? 0) >= 1440 || (input.estimatedBitrate ?? 0) >= 8_000_000;
 
   const phase = input.phase ?? "steady";
-  const baseWindow = clamp(input.preferredWindow, 4, 24);
+  const baseWindow = 12;
   const configuredTargetSeconds = clamp(input.aggressivePrefetchSeconds, 48, 48);
   const remainingSeconds = Number.isFinite(input.remainingSeconds ?? NaN)
     ? Math.max(0, input.remainingSeconds ?? 0)
@@ -60,10 +60,11 @@ export function resolvePrefetchDecision(input: PrefetchDecisionInput): PrefetchD
     2_500_000,
     input.estimatedBitrate ?? (highBitrateMode ? 12_000_000 : 5_000_000),
   );
+  const multiplier = phase === "seek" ? 2.1 : phase === "initial" ? 1.9 : 1.6;
   const cacheLimitBytes = clampBytes(
-    Math.round((bitrateEstimate / 8) * Math.max(targetSeconds, 12) * (phase === "seek" ? 2.1 : 1.8)),
-    highBitrateMode ? 192 * MB : 96 * MB,
-    highBitrateMode ? 1024 * MB : 384 * MB,
+    Math.round((bitrateEstimate / 8) * Math.max(targetSeconds, 12) * multiplier),
+    highBitrateMode ? 256 * MB : 128 * MB,
+    1024 * MB,
   );
 
   return {

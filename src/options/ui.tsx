@@ -74,7 +74,7 @@ export function OptionsApp(): React.JSX.Element {
           onChange={(value) => void patch({ vod: { aggressivePrefetchSeconds: Number(value) } })}
         />
         <NumberField
-          label="Max concurrency"
+          label="Max concurrency ceiling"
           testId="vod-max-concurrency"
           value={policy.vod.maxConcurrentRequests}
           onChange={(value) =>

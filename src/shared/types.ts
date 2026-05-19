@@ -46,14 +46,20 @@ export interface ExtensionPolicy {
 export interface PageStatus {
   pageKind: PageKind;
   mode: PlaybackMode;
+  downloadPhase: "initial" | "seek" | "steady" | "liveUrgent";
   quality: number | null;
   codec: string | null;
   host: string | null;
   protocol: string | null;
   bufferedSeconds: number;
+  targetBufferSeconds: number;
   avgSegmentDurationMs: number;
+  avgVodSegmentSeconds: number;
   prefetchQueueDepth: number;
   cacheBytes: number;
+  controllerConcurrency: number;
+  recentThroughputMbps: number;
+  activeSegmentDownloads: number;
   activeRangeJobs: number;
   rangeSplitActive: boolean;
   prefetchHitCount: number;

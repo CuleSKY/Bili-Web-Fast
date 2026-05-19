@@ -9,7 +9,7 @@ const DEFAULT_POLICY = {
         codecPreference: "auto",
         prefetchWindow: 12,
         aggressivePrefetchSeconds: 48,
-        maxConcurrentRequests: 12,
+        maxConcurrentRequests: 24,
         experimentalRangeSplit: false,
         rangeChunkSizeKb: 2048,
         seekBoostWindow: 12,
@@ -54,11 +54,30 @@ const prefetchQueue = [];
 const liveSeenSegments = new Set();
 const nativeFetch = window.fetch.bind(window);
 const inflightRangeRequests = new Map();
+const activeMediaFetches = new Set();
+const downloadSamples = [];
 let prefetchActive = 0;
 let cacheBytes = 0;
 let prefetchHitCount = 0;
 let rangeChunkRetryCount = 0;
 let lastMediaUrl = null;
+let activeRangeChunkJobs = 0;
+let lastBufferedRangeEnd = 0;
+let downloadController = {
+    downloadPhase: "initial",
+    targetBufferSeconds: 48,
+    controllerTargetConcurrency: 14,
+    controllerAppliedConcurrency: 14,
+    recentThroughputBps: 0,
+    recentErrorRate: 0,
+    recentRetryRate: 0,
+    recentBytesPerRequest: 0,
+    avgVodSegmentSeconds: 4,
+    activeSegmentDownloads: 0,
+    lastControllerTickMs: 0,
+    lowGainStreak: 0,
+    previousThroughputBps: 0,
+};
 let vodSelection = {
     quality: null,
     codec: null,
@@ -86,9 +105,15 @@ let seekState = {
 const state = buildStatus({
     pageKind,
     mode: DEFAULT_POLICY.mode,
+    downloadPhase: "initial",
+    targetBufferSeconds: pageKind === "live" ? DEFAULT_POLICY.live.stableBufferTargetSeconds : 48,
     avgSegmentDurationMs: 0,
+    avgVodSegmentSeconds: 4,
     prefetchQueueDepth: 0,
     cacheBytes: 0,
+    controllerConcurrency: 14,
+    recentThroughputMbps: 0,
+    activeSegmentDownloads: 0,
     activeRangeJobs: 0,
     rangeSplitActive: false,
     prefetchHitCount: 0,
@@ -109,6 +134,7 @@ try {
     installMediaHooks();
     installMseHooks();
     installDebugSurface();
+    installDownloadController();
     publishStatus();
     document.documentElement.dataset.bwfPage = "ready";
 }
@@ -158,15 +184,44 @@ function installFetchHook() {
             return responseFromCache(prefetched);
         }
         const started = performance.now();
-        const splitResponse = resourceKind === "media" ? await maybeServeMediaWithRangeSplit(requestUrl, input, init) : null;
-        const { response, finalUrl } = splitResponse
-            ? { response: splitResponse, finalUrl: requestUrl }
-            : await performFetchWithFallback(nativeFetch, input, init, requestUrl, resourceKind);
+        if (resourceKind === "media") {
+            activeMediaFetches.add(requestUrl);
+        }
+        let response;
+        let finalUrl;
+        let usedSplitResponse = false;
+        try {
+            const splitResponse = resourceKind === "media" ? await maybeServeMediaWithRangeSplit(requestUrl, input, init) : null;
+            usedSplitResponse = Boolean(splitResponse);
+            const resolved = splitResponse
+                ? { response: splitResponse, finalUrl: requestUrl }
+                : await performFetchWithFallback(nativeFetch, input, init, requestUrl, resourceKind);
+            response = resolved.response;
+            finalUrl = resolved.finalUrl;
+        }
+        finally {
+            if (resourceKind === "media") {
+                activeMediaFetches.delete(requestUrl);
+            }
+        }
         const responseForPage = await maybeRewriteFetchResponse(requestUrl, response);
         const durationMs = Math.round(performance.now() - started);
         const clone = responseForPage.clone();
         noteActiveMediaHost(finalUrl, resourceKind);
         noteHostSuccess(finalUrl, durationMs);
+        if (resourceKind === "media" && !usedSplitResponse) {
+            const sampleBytes = Number(responseForPage.headers.get("content-length") ?? "0");
+            recordDownloadSample({
+                ts: Date.now(),
+                ok: responseForPage.ok,
+                bytes: responseForPage.ok && Number.isFinite(sampleBytes) ? sampleBytes : 0,
+                retry: false,
+                durationMs,
+            });
+        }
+        if (resourceKind === "media" && responseForPage.ok) {
+            void storeFetchedMediaResponse(finalUrl, responseForPage.clone());
+        }
         void handleFetchResponse(finalUrl, resourceKind, clone, durationMs);
         if (resourceKind === "media" && responseForPage.ok) {
             noteSegmentDuration(durationMs);
@@ -427,6 +482,20 @@ function updateBuffered(video) {
     const buffered = video.buffered;
     if (buffered.length > 0) {
         state.bufferedSeconds = Math.max(0, buffered.end(buffered.length - 1) - video.currentTime);
+        if (pageKind === "vod") {
+            const bufferedEnd = buffered.end(buffered.length - 1);
+            if (bufferedEnd + 1 < lastBufferedRangeEnd) {
+                lastBufferedRangeEnd = bufferedEnd;
+            }
+            const delta = bufferedEnd - lastBufferedRangeEnd;
+            if (delta > 0.25 && delta < 20) {
+                downloadController.avgVodSegmentSeconds = clampNumber(downloadController.avgVodSegmentSeconds * 0.75 + delta * 0.25, 1, 8);
+                lastBufferedRangeEnd = bufferedEnd;
+            }
+            else if (delta >= 20) {
+                lastBufferedRangeEnd = bufferedEnd;
+            }
+        }
     }
     else {
         state.bufferedSeconds = 0;
@@ -583,16 +652,23 @@ function publishStatus() {
     window.postMessage({ source: PAGE_MESSAGE_SOURCE, kind: "status", status: next }, "*");
 }
 function updateDerivedMetrics() {
+    refreshDownloadController();
     state.avgSegmentDurationMs =
         segmentDurations.length > 0
             ? Math.round(segmentDurations.reduce((sum, value) => sum + value, 0) / segmentDurations.length)
             : 0;
     state.prefetchQueueDepth = prefetchQueue.length + inflightPrefetches.size;
     state.cacheBytes = cacheBytes;
-    state.activeRangeJobs = inflightRangeRequests.size;
+    state.downloadPhase = downloadController.downloadPhase;
+    state.targetBufferSeconds = downloadController.targetBufferSeconds;
+    state.avgVodSegmentSeconds = downloadController.avgVodSegmentSeconds;
+    state.controllerConcurrency = downloadController.controllerAppliedConcurrency;
+    state.recentThroughputMbps = downloadController.recentThroughputBps / 1_000_000;
+    state.activeSegmentDownloads = downloadController.activeSegmentDownloads;
+    state.activeRangeJobs = inflightRangeRequests.size + activeRangeChunkJobs;
     state.prefetchHitCount = prefetchHitCount;
     state.rangeChunkRetryCount = rangeChunkRetryCount;
-    state.rangeSplitActive = inflightRangeRequests.size > 0;
+    state.rangeSplitActive = inflightRangeRequests.size + activeRangeChunkJobs > 0;
     state.seekInProgress = seekState.active;
     state.lastSeekTargetBuffered = seekState.targetBuffered;
     state.activeMediaHost = parseHost(lastMediaUrl) ?? state.host;
@@ -679,8 +755,9 @@ function updateOverlay() {
             `quality=${state.quality ?? "-"} codec=${state.codec ?? "-"}`,
             `host=${state.host ?? "-"}`,
             `protocol=${state.protocol ?? "-"}`,
-            `buffer=${state.bufferedSeconds.toFixed(2)}s ready=${currentReadyState()}`,
-            `seg=${state.avgSegmentDurationMs}ms prefetch=${state.prefetchQueueDepth} cache=${formatBytes(state.cacheBytes)}`,
+            `phase=${state.downloadPhase} buffer=${state.bufferedSeconds.toFixed(2)}s target=${state.targetBufferSeconds.toFixed(1)}s ready=${currentReadyState()}`,
+            `seg=${state.avgSegmentDurationMs}ms vodSeg=${state.avgVodSegmentSeconds.toFixed(2)}s prefetch=${state.prefetchQueueDepth} cache=${formatBytes(state.cacheBytes)}`,
+            `concurrency=${state.controllerConcurrency} throughput=${state.recentThroughputMbps.toFixed(1)}Mbps segmentDl=${state.activeSegmentDownloads}`,
             `range=${state.activeRangeJobs} split=${state.rangeSplitActive} hits=${state.prefetchHitCount} retries=${state.rangeChunkRetryCount}`,
             `wait1m=${state.waitingCount1m} stall1m=${state.stalledCount1m} dropped=${state.droppedFrames}`,
             `seek=${state.seekInProgress ? "active" : state.lastSeekRecoveryMs == null ? "-" : `${state.lastSeekRecoveryMs}ms`} targetBuffered=${state.lastSeekTargetBuffered}`,
@@ -699,8 +776,8 @@ function installDebugSurface() {
             cacheBytes,
             cacheEntries: mediaCache.size,
             prefetchQueueDepth: prefetchQueue.length + inflightPrefetches.size,
-            hostFallbacks: hostFallbacks.size,
-            activeRangeJobs: inflightRangeRequests.size,
+            hostFallbacks: 0,
+            activeRangeJobs: inflightRangeRequests.size + activeRangeChunkJobs,
             mode: state.mode,
         }),
         setMode: (mode) => {
@@ -713,6 +790,178 @@ function installDebugSurface() {
             updateOverlay();
         },
     };
+}
+function installDownloadController() {
+    window.setInterval(() => {
+        refreshDownloadController();
+        if (pageKind === "live" || prefetchQueue.length > 0 || prefetchActive > 0 || inflightRangeRequests.size > 0) {
+            publishStatus();
+        }
+    }, 500);
+}
+function refreshDownloadController(force = false) {
+    const now = Date.now();
+    if (!force && now - downloadController.lastControllerTickMs < 500) {
+        return;
+    }
+    const phase = resolveDownloadPhase();
+    const targetBufferSeconds = resolveTargetBufferSeconds(phase);
+    trimDownloadSamples(now);
+    const successful = downloadSamples.filter((sample) => sample.ok);
+    const failed = downloadSamples.filter((sample) => !sample.ok);
+    const retried = downloadSamples.filter((sample) => sample.retry);
+    const throughputBytes = successful.reduce((sum, sample) => sum + sample.bytes, 0);
+    const recentThroughputBps = throughputBytes / 2;
+    const totalSamples = downloadSamples.length;
+    const recentErrorRate = totalSamples > 0 ? failed.length / totalSamples : 0;
+    const recentRetryRate = totalSamples > 0 ? retried.length / totalSamples : 0;
+    const recentBytesPerRequest = successful.length > 0
+        ? successful.reduce((sum, sample) => sum + sample.bytes, 0) / successful.length
+        : 0;
+    const activeSegmentDownloads = prefetchActive + inflightRangeRequests.size;
+    const queueDepth = prefetchQueue.length + activeSegmentDownloads;
+    const base = resolveControllerBaseline(phase);
+    const decision = resolveControllerDecision({
+        minConcurrency: base.minConcurrency,
+        maxConcurrency: Math.min(policy.vod.maxConcurrentRequests, base.maxConcurrency),
+        currentConcurrency: downloadController.controllerAppliedConcurrency,
+        previousThroughputBps: downloadController.previousThroughputBps,
+        recentThroughputBps,
+        recentErrorRate,
+        queueDepth,
+        lowGainStreak: downloadController.lowGainStreak,
+        bufferedSeconds: state.bufferedSeconds,
+        targetBufferSeconds,
+        seekUrgent: phase === "seek" && seekState.active && !seekState.targetBuffered,
+        liveUrgent: phase === "liveUrgent",
+        cacheSatisfied: cacheBytes >= resolveCacheTargetBytes(phase, targetBufferSeconds),
+    });
+    downloadController = {
+        downloadPhase: phase,
+        targetBufferSeconds,
+        controllerTargetConcurrency: decision.nextConcurrency,
+        controllerAppliedConcurrency: decision.nextConcurrency,
+        recentThroughputBps,
+        recentErrorRate,
+        recentRetryRate,
+        recentBytesPerRequest,
+        avgVodSegmentSeconds: resolveAvgVodSegmentSeconds(),
+        activeSegmentDownloads,
+        lastControllerTickMs: now,
+        lowGainStreak: decision.nextLowGainStreak,
+        previousThroughputBps: recentThroughputBps,
+    };
+}
+function recordDownloadSample(sample) {
+    downloadSamples.push(sample);
+    trimDownloadSamples(sample.ts);
+}
+function trimDownloadSamples(now) {
+    while (downloadSamples.length > 0 && now - downloadSamples[0].ts > 2_000) {
+        downloadSamples.shift();
+    }
+}
+function resolveDownloadPhase() {
+    if (pageKind === "live") {
+        return state.bufferedSeconds < 1.5 ? "liveUrgent" : "steady";
+    }
+    if (seekState.active && !seekState.targetBuffered) {
+        return "seek";
+    }
+    const video = document.querySelector("video");
+    const currentTime = video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    if (segmentDurations.length < 2 || currentTime < 3 || state.bufferedSeconds < 4) {
+        return "initial";
+    }
+    return "steady";
+}
+function resolveTargetBufferSeconds(phase) {
+    if (phase === "liveUrgent") {
+        return 1.5;
+    }
+    if (pageKind === "live") {
+        return policy.live.stableBufferTargetSeconds;
+    }
+    const remainingSeconds = getVodPrefetchContext().remainingSeconds;
+    if (remainingSeconds != null && remainingSeconds > 0) {
+        return Math.min(48, remainingSeconds);
+    }
+    return 48;
+}
+function resolveControllerBaseline(phase) {
+    if (phase === "seek") {
+        return { minConcurrency: 12, maxConcurrency: 24, startConcurrency: 18 };
+    }
+    if (phase === "initial") {
+        return { minConcurrency: 10, maxConcurrency: 20, startConcurrency: 14 };
+    }
+    if (phase === "liveUrgent") {
+        return { minConcurrency: 8, maxConcurrency: 16, startConcurrency: 16 };
+    }
+    return { minConcurrency: 8, maxConcurrency: 16, startConcurrency: 10 };
+}
+function resolveControllerDecision(input) {
+    if (input.seekUrgent || input.liveUrgent) {
+        return {
+            nextConcurrency: input.maxConcurrency,
+            nextLowGainStreak: 0,
+        };
+    }
+    if (input.queueDepth <= 0) {
+        if (input.bufferedSeconds > input.targetBufferSeconds + 8 && input.cacheSatisfied) {
+            return {
+                nextConcurrency: input.minConcurrency,
+                nextLowGainStreak: 0,
+            };
+        }
+        return {
+            nextConcurrency: clampNumber(input.currentConcurrency, input.minConcurrency, input.maxConcurrency),
+            nextLowGainStreak: 0,
+        };
+    }
+    const throughputGain = input.previousThroughputBps > 0
+        ? (input.recentThroughputBps - input.previousThroughputBps) / input.previousThroughputBps
+        : input.recentThroughputBps > 0
+            ? 1
+            : 0;
+    if (input.recentErrorRate >= 0.05) {
+        return {
+            nextConcurrency: clampNumber(input.currentConcurrency - 2, input.minConcurrency, input.maxConcurrency),
+            nextLowGainStreak: 0,
+        };
+    }
+    if (throughputGain >= 0.08 && input.recentErrorRate < 0.03) {
+        return {
+            nextConcurrency: clampNumber(input.currentConcurrency + 2, input.minConcurrency, input.maxConcurrency),
+            nextLowGainStreak: 0,
+        };
+    }
+    const nextLowGainStreak = Math.abs(throughputGain) < 0.03 ? input.lowGainStreak + 1 : 0;
+    if (nextLowGainStreak >= 3) {
+        return {
+            nextConcurrency: clampNumber(input.currentConcurrency - 2, input.minConcurrency, input.maxConcurrency),
+            nextLowGainStreak: 0,
+        };
+    }
+    if (input.bufferedSeconds > input.targetBufferSeconds + 8 && input.cacheSatisfied) {
+        return {
+            nextConcurrency: input.minConcurrency,
+            nextLowGainStreak: 0,
+        };
+    }
+    return {
+        nextConcurrency: clampNumber(input.currentConcurrency, input.minConcurrency, input.maxConcurrency),
+        nextLowGainStreak,
+    };
+}
+function resolveAvgVodSegmentSeconds() {
+    return clampNumber(downloadController.avgVodSegmentSeconds || 4, 1, 8);
+}
+function resolveCacheTargetBytes(phase, windowSeconds) {
+    const bitrateEstimate = Math.max(2_500_000, vodSelection.bitrate ?? 5_000_000);
+    const highBitrateMode = (state.quality ?? 0) >= 1440 || bitrateEstimate >= 8_000_000;
+    const multiplier = phase === "seek" ? 2.1 : phase === "initial" ? 1.9 : 1.6;
+    return clampNumber(Math.round((bitrateEstimate / 8) * windowSeconds * multiplier), highBitrateMode ? 256 * 1024 * 1024 : 128 * 1024 * 1024, 1024 * 1024 * 1024);
 }
 function classifyResource(url) {
     if (/x\/player\/wbi\/playurl/.test(url)) {
@@ -908,11 +1157,8 @@ function getVodPrefetchContext() {
     const remainingSeconds = durationSeconds != null
         ? Math.max(0, durationSeconds - (currentTime ?? 0))
         : null;
-    const phase = shouldBoostSeekPrefetch()
-        ? "seek"
-        : currentTime == null || currentTime < 3 || state.bufferedSeconds < 4 || segmentDurations.length < 2
-            ? "initial"
-            : "steady";
+    const resolvedPhase = resolveDownloadPhase();
+    const phase = resolvedPhase === "seek" || resolvedPhase === "initial" ? resolvedPhase : "steady";
     return {
         phase,
         currentTime,
@@ -932,7 +1178,7 @@ function resolveVodDurationSeconds(payload) {
     return null;
 }
 function estimateVodSegmentDurationMs(_context) {
-    return 4_000;
+    return Math.round(resolveAvgVodSegmentSeconds() * 1000);
 }
 function buildVodPrefetchTasks(currentUrl, decision, context) {
     const tasks = [];
@@ -940,6 +1186,7 @@ function buildVodPrefetchTasks(currentUrl, decision, context) {
     const boostCount = context.phase === "seek" ? Math.max(4, policy.vod.seekBoostWindow) : 0;
     const currentTrack = inferVodTrack(currentUrl);
     const currentWindow = currentTrack === "audio" ? decision.audioWindow : decision.videoWindow;
+    queueTask(tasks, currentUrl, priority);
     appendTrackPrefetchTasks(tasks, currentUrl, Math.max(0, currentWindow - 1), priority, boostCount);
     const currentSequence = extractUrlSequence(currentUrl);
     if (currentSequence != null) {
@@ -994,7 +1241,7 @@ function replaceUrlSequence(templateUrl, sequence) {
 }
 function queuePrefetch(task) {
     const normalized = task.url;
-    if (mediaCache.has(normalized) || inflightPrefetches.has(normalized)) {
+    if (mediaCache.has(normalized) || inflightPrefetches.has(normalized) || activeMediaFetches.has(normalized)) {
         return;
     }
     const existingIndex = prefetchQueue.findIndex((item) => item.url === normalized);
@@ -1014,15 +1261,8 @@ function queuePrefetch(task) {
     drainPrefetchQueue();
 }
 function drainPrefetchQueue() {
-    const decision = resolvePrefetchDecision({
-        preferredWindow: policy.vod.prefetchWindow,
-        aggressivePrefetchSeconds: policy.vod.aggressivePrefetchSeconds,
-        maxConcurrentRequests: policy.vod.maxConcurrentRequests,
-        quality: state.quality,
-        estimatedBitrate: vodSelection.bitrate,
-        avgSegmentDurationMs: state.avgSegmentDurationMs,
-    });
-    while (prefetchActive < decision.totalConcurrency && prefetchQueue.length > 0) {
+    const concurrency = Math.max(1, downloadController.controllerAppliedConcurrency);
+    while (prefetchActive < concurrency && prefetchQueue.length > 0) {
         const task = takeNextPrefetchTask();
         if (!task) {
             break;
@@ -1041,16 +1281,23 @@ function drainPrefetchQueue() {
     updateDerivedMetrics();
 }
 async function runPrefetch(task) {
+    const rangeEntry = task.kind === "media" && pageKind === "vod" ? await downloadPrefetchByRange(task) : null;
+    if (rangeEntry) {
+        storeCacheEntry(rangeEntry);
+        return rangeEntry;
+    }
     const started = performance.now();
     const response = await nativeFetch(task.url, { cache: "no-store", credentials: "include" });
     const durationMs = Math.round(performance.now() - started);
     if (!response.ok) {
         noteHostFailure(task.url);
         emitNetworkEvent("prefetch", task.url, durationMs, false, undefined, task.priority);
+        recordDownloadSample({ ts: Date.now(), ok: false, bytes: 0, retry: false, durationMs });
         return null;
     }
     noteHostSuccess(task.url, durationMs);
     const body = await response.arrayBuffer();
+    recordDownloadSample({ ts: Date.now(), ok: true, bytes: body.byteLength, retry: false, durationMs });
     const entry = {
         url: task.url,
         body,
@@ -1065,6 +1312,57 @@ async function runPrefetch(task) {
     emitNetworkEvent("prefetch", task.url, durationMs, true, body.byteLength, task.priority);
     noteSegmentDuration(durationMs);
     return entry;
+}
+async function downloadPrefetchByRange(task) {
+    const probe = await probeRangeSupport(task.url);
+    if (!probe) {
+        return null;
+    }
+    const tasks = [];
+    for (let start = 0; start < probe.contentLength; start += 2 * 1024 * 1024) {
+        const end = Math.min(probe.contentLength - 1, start + 2 * 1024 * 1024 - 1);
+        tasks.push({
+            url: task.url,
+            start,
+            end,
+            bytesTotal: probe.contentLength,
+            reason: task.priority === "seek" ? "seek" : "playback",
+        });
+    }
+    const buffers = await runRangeChunkTasks(tasks, undefined, resolveRangeSplitConcurrency(tasks[0]?.reason ?? "playback"));
+    if (buffers.some((buffer) => buffer == null)) {
+        return null;
+    }
+    const body = concatArrayBuffers(buffers);
+    const durationMs = 0;
+    emitNetworkEvent("prefetch", task.url, durationMs, true, body.byteLength, `range:${tasks.length}`);
+    return {
+        url: task.url,
+        body,
+        status: 200,
+        statusText: "OK",
+        headers: [...probe.headers.entries()],
+        bytes: body.byteLength,
+        createdAt: Date.now(),
+        source: "range",
+    };
+}
+async function probeRangeSupport(url, init) {
+    const head = await nativeFetch(url, {
+        method: "HEAD",
+        cache: "no-store",
+        credentials: "include",
+        headers: cloneRequestHeaders(init?.headers),
+    }).catch(() => null);
+    if (!head?.ok) {
+        return null;
+    }
+    const acceptsRanges = /bytes/i.test(head.headers.get("accept-ranges") ?? "");
+    const contentLength = Number(head.headers.get("content-length") ?? "0");
+    if (!acceptsRanges || !Number.isFinite(contentLength) || contentLength <= 0) {
+        return null;
+    }
+    return { contentLength, headers: cloneHeaders(head.headers) };
 }
 function takeCachedResponse(url) {
     const entry = mediaCache.get(url);
@@ -1143,29 +1441,18 @@ function shouldUseRangeSplit(url, init) {
     return !((init?.headers instanceof Headers && init.headers.has("range")) || hasRangeHeader(init?.headers));
 }
 async function runRangeSplitRequest(url, _input, init) {
-    const head = await nativeFetch(url, {
-        method: "HEAD",
-        cache: "no-store",
-        credentials: "include",
-        headers: cloneRequestHeaders(init?.headers),
-    }).catch(() => null);
-    if (!head?.ok) {
+    const probe = await probeRangeSupport(url, init);
+    if (!probe) {
         return null;
     }
-    const acceptsRanges = /bytes/i.test(head.headers.get("accept-ranges") ?? "");
-    const contentLength = Number(head.headers.get("content-length") ?? "0");
-    if (!acceptsRanges || !Number.isFinite(contentLength) || contentLength <= 0) {
-        return null;
-    }
-    const chunkSize = Math.max(256 * 1024, policy.vod.rangeChunkSizeKb * 1024);
     const tasks = [];
-    for (let start = 0; start < contentLength; start += chunkSize) {
-        const end = Math.min(contentLength - 1, start + chunkSize - 1);
+    for (let start = 0; start < probe.contentLength; start += 2 * 1024 * 1024) {
+        const end = Math.min(probe.contentLength - 1, start + 2 * 1024 * 1024 - 1);
         tasks.push({
             url,
             start,
             end,
-            bytesTotal: contentLength,
+            bytesTotal: probe.contentLength,
             reason: seekState.active && !seekState.targetBuffered ? "seek" : "playback",
         });
     }
@@ -1179,13 +1466,14 @@ async function runRangeSplitRequest(url, _input, init) {
     return new Response(merged, {
         status: 200,
         statusText: "OK",
-        headers: cloneHeaders(head.headers),
+        headers: probe.headers,
     });
 }
 async function fetchRangeChunk(task, init) {
     const headers = cloneRequestHeaders(init?.headers);
     headers.set("range", `bytes=${task.start}-${task.end}`);
     const started = performance.now();
+    activeRangeChunkJobs += 1;
     try {
         const response = await nativeFetch(task.url, {
             ...init,
@@ -1198,15 +1486,22 @@ async function fetchRangeChunk(task, init) {
             noteHostFailure(task.url);
             noteHostCooldown(task.url);
             emitNetworkEvent("media", task.url, durationMs, false, undefined, `range:${task.start}-${task.end}`);
+            recordDownloadSample({ ts: Date.now(), ok: false, bytes: 0, retry: false, durationMs });
             return retryRangeChunk(task, init);
         }
         noteHostSuccess(task.url, durationMs);
-        return await response.arrayBuffer();
+        const body = await response.arrayBuffer();
+        recordDownloadSample({ ts: Date.now(), ok: true, bytes: body.byteLength, retry: false, durationMs });
+        return body;
     }
     catch {
         noteHostFailure(task.url);
         noteHostCooldown(task.url);
+        recordDownloadSample({ ts: Date.now(), ok: false, bytes: 0, retry: false, durationMs: Math.round(performance.now() - started) });
         return retryRangeChunk(task, init);
+    }
+    finally {
+        activeRangeChunkJobs = Math.max(0, activeRangeChunkJobs - 1);
     }
 }
 async function retryRangeChunk(task, init) {
@@ -1214,6 +1509,7 @@ async function retryRangeChunk(task, init) {
     const headers = cloneRequestHeaders(init?.headers);
     headers.set("range", `bytes=${task.start}-${task.end}`);
     const started = performance.now();
+    activeRangeChunkJobs += 1;
     const response = await nativeFetch(task.url, {
         ...init,
         cache: "no-store",
@@ -1225,10 +1521,15 @@ async function retryRangeChunk(task, init) {
         noteHostFailure(task.url);
         noteHostCooldown(task.url);
         emitNetworkEvent("media", task.url, durationMs, false, undefined, `range-retry:${task.start}-${task.end}`);
+        recordDownloadSample({ ts: Date.now(), ok: false, bytes: 0, retry: true, durationMs });
+        activeRangeChunkJobs = Math.max(0, activeRangeChunkJobs - 1);
         return null;
     }
     noteHostSuccess(task.url, durationMs);
-    return await response.arrayBuffer();
+    const body = await response.arrayBuffer();
+    recordDownloadSample({ ts: Date.now(), ok: true, bytes: body.byteLength, retry: true, durationMs });
+    activeRangeChunkJobs = Math.max(0, activeRangeChunkJobs - 1);
+    return body;
 }
 async function runRangeChunkTasks(tasks, init, concurrency) {
     const results = new Array(tasks.length).fill(null);
@@ -1277,15 +1578,7 @@ function storeCacheEntry(entry) {
     }
     mediaCache.set(entry.url, entry);
     cacheBytes += entry.bytes;
-    const decision = resolvePrefetchDecision({
-        preferredWindow: policy.vod.prefetchWindow,
-        aggressivePrefetchSeconds: policy.vod.aggressivePrefetchSeconds,
-        maxConcurrentRequests: policy.vod.maxConcurrentRequests,
-        quality: state.quality,
-        estimatedBitrate: vodSelection.bitrate,
-        avgSegmentDurationMs: state.avgSegmentDurationMs,
-    });
-    evictCache(decision.cacheLimitBytes);
+    evictCache(resolveCacheTargetBytes(downloadController.downloadPhase, downloadController.targetBufferSeconds));
     updateDerivedMetrics();
 }
 function evictCache(limitBytes) {
@@ -1811,11 +2104,11 @@ function takeNextPrefetchTask() {
     return prefetchQueue.shift();
 }
 function resolveRangeSplitConcurrency(reason) {
-    const configured = Math.max(2, policy.vod.maxConcurrentRequests);
+    const configured = Math.max(4, downloadController.controllerAppliedConcurrency);
     if (reason === "seek") {
-        return configured;
+        return clampNumber(Math.round(configured / 2) + 2, 8, 12);
     }
-    return Math.max(2, configured);
+    return clampNumber(Math.round(configured / 2), 4, 8);
 }
 function detectPageKind(url) {
     if (/^https:\/\/live\.bilibili\.com\//.test(url)) {
@@ -1833,14 +2126,20 @@ function buildStatus(partial, recentTelemetry) {
     return {
         pageKind: partial.pageKind ?? "unknown",
         mode: partial.mode ?? "stable",
+        downloadPhase: partial.downloadPhase ?? "steady",
         quality: partial.quality ?? null,
         codec: partial.codec ?? null,
         host: partial.host ?? null,
         protocol: partial.protocol ?? null,
         bufferedSeconds: partial.bufferedSeconds ?? 0,
+        targetBufferSeconds: partial.targetBufferSeconds ?? 0,
         avgSegmentDurationMs: partial.avgSegmentDurationMs ?? 0,
+        avgVodSegmentSeconds: partial.avgVodSegmentSeconds ?? 4,
         prefetchQueueDepth: partial.prefetchQueueDepth ?? 0,
         cacheBytes: partial.cacheBytes ?? 0,
+        controllerConcurrency: partial.controllerConcurrency ?? 0,
+        recentThroughputMbps: partial.recentThroughputMbps ?? 0,
+        activeSegmentDownloads: partial.activeSegmentDownloads ?? 0,
         activeRangeJobs: partial.activeRangeJobs ?? 0,
         rangeSplitActive: partial.rangeSplitActive ?? false,
         prefetchHitCount: partial.prefetchHitCount ?? 0,
@@ -1914,7 +2213,7 @@ function liveCodecScore(codecName) {
 function resolvePrefetchDecision(input) {
     const highBitrateMode = (input.quality ?? 0) >= 1440 || (input.estimatedBitrate ?? 0) >= 8_000_000;
     const phase = input.phase ?? "steady";
-    const baseWindow = Math.min(24, Math.max(4, input.preferredWindow || 4));
+    const baseWindow = 12;
     const configuredTargetSeconds = 48;
     const remainingSeconds = Number.isFinite(input.remainingSeconds ?? NaN)
         ? Math.max(0, input.remainingSeconds ?? 0)
@@ -1932,7 +2231,8 @@ function resolvePrefetchDecision(input) {
     const audioWindow = cacheEntireRemaining ? videoWindow : Math.min(18, Math.max(4, videoWindow));
     const totalConcurrency = Math.min(16, Math.max(8, Math.max(input.maxConcurrentRequests, phase === "seek" ? 16 : phase === "initial" ? 14 : Math.min(videoWindow + 2, 12))));
     const bitrateEstimate = Math.max(2_500_000, input.estimatedBitrate ?? (highBitrateMode ? 12_000_000 : 5_000_000));
-    const cacheLimitBytes = clampNumber(Math.round((bitrateEstimate / 8) * Math.max(targetSeconds, 12) * (phase === "seek" ? 2.1 : 1.8)), highBitrateMode ? 192 * 1024 * 1024 : 96 * 1024 * 1024, highBitrateMode ? 1024 * 1024 * 1024 : 384 * 1024 * 1024);
+    const multiplier = phase === "seek" ? 2.1 : phase === "initial" ? 1.9 : 1.6;
+    const cacheLimitBytes = clampNumber(Math.round((bitrateEstimate / 8) * Math.max(targetSeconds, 12) * multiplier), highBitrateMode ? 256 * 1024 * 1024 : 128 * 1024 * 1024, 1024 * 1024 * 1024);
     return {
         videoWindow,
         audioWindow,

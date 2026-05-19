@@ -87,9 +87,15 @@ export function PopupApp(): React.JSX.Element {
         <StatusLine label="Codec" value={status?.codec ?? "-"} />
         <StatusLine label="Host" value={status?.host ?? "-"} />
         <StatusLine label="Protocol" value={status?.protocol ?? "-"} />
+        <StatusLine label="Phase" value={status?.downloadPhase ?? "-"} />
         <StatusLine label="Buffer" value={`${status?.bufferedSeconds?.toFixed(2) ?? "0.00"}s`} />
+        <StatusLine label="Target Buffer" value={`${status?.targetBufferSeconds?.toFixed(1) ?? "0.0"}s`} />
         <StatusLine label="Segment Avg" value={`${status?.avgSegmentDurationMs ?? 0} ms`} />
+        <StatusLine label="Seg Seconds" value={`${status?.avgVodSegmentSeconds?.toFixed(2) ?? "4.00"}s`} />
         <StatusLine label="Prefetch" value={status?.prefetchQueueDepth ?? 0} />
+        <StatusLine label="Ctrl Concurrency" value={status?.controllerConcurrency ?? 0} />
+        <StatusLine label="Throughput" value={`${status?.recentThroughputMbps?.toFixed(1) ?? "0.0"} Mbps`} />
+        <StatusLine label="Segment DL" value={status?.activeSegmentDownloads ?? 0} />
         <StatusLine label="Range Jobs" value={status?.activeRangeJobs ?? 0} />
         <StatusLine label="Cache" value={formatBytes(status?.cacheBytes ?? 0)} />
         <StatusLine label="Waiting(1m)" value={status?.waitingCount1m ?? 0} />
