@@ -17,6 +17,11 @@
   "author": "",
   "license": "ISC",
   "type": "module",
+  "overrides": {
+    "@crxjs/vite-plugin": {
+      "rollup": "2.80.0"
+    }
+  },
   "dependencies": {
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
