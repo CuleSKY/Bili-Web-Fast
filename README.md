@@ -4,6 +4,11 @@
 
 Bili Web Fast 用于解决海外B站网页端视频和直播播放卡顿的问题。这个代码100%由AI编写，仅为个人自用的小工具，不考虑上架扩展应用商店，请Clone仓库后自行编译。**若介意请勿使用**
 推荐配合 https://github.com/Kanda-Akihito-Kun/ccb 项目使用最佳
+个人推荐的视频和直播CDN（加拿大Telus）
+```
+视频：cn-hk-eq-01-03.bilivideo.com
+直播：d1--ov-gotcha207.bilivideo.com
+```
 
 ---
 
