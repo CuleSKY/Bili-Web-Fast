@@ -90,6 +90,9 @@ const RECOVERY_LIMITS = {
   qualityDropCooldownMs: 30_000,
   rebuildCooldownMs: 60_000,
 };
+const VOD_BACKGROUND_PUMP_INTERVAL_MS = 1_000;
+const nativeDocumentHiddenGetter = getDocumentGetter<boolean>("hidden");
+const nativeDocumentVisibilityStateGetter = getDocumentGetter<DocumentVisibilityState>("visibilityState");
 
 interface CacheEntry {
   url: string;
@@ -213,6 +216,8 @@ let cacheBytes = 0;
 let prefetchHitCount = 0;
 let rangeChunkRetryCount = 0;
 let lastMediaUrl: string | null = null;
+let lastVodPrefetchSeedUrl: string | null = null;
+let lastVodBackgroundPumpAt = 0;
 let lastLivePlaylistUrl: string | null = null;
 let lastLiveLeafPlaylistUrl: string | null = null;
 let lastLivePlaylistRefreshAt = 0;
@@ -291,6 +296,7 @@ const state: PageStatus = buildStatus(
 document.documentElement.dataset.bwfPage = "booting";
 
 try {
+  installVodVisibilityGuard();
   installBridge();
   installFetchHook();
   installXhrHook();
@@ -403,6 +409,7 @@ function installFetchHook(): void {
 
     if (resourceKind === "media" && drivesStreamingPipeline && responseForPage.ok) {
       noteSegmentDuration(durationMs);
+      lastVodPrefetchSeedUrl = finalUrl;
       scheduleVodPrefetch(finalUrl);
     } else if (resourceKind === "playlist" && drivesStreamingPipeline && responseForPage.ok) {
       void scheduleLivePlaylistPrefetch(finalUrl, responseForPage.clone());
@@ -509,18 +516,32 @@ function installMediaHooks(): void {
 function installVisibilityHooks(): void {
   document.addEventListener("visibilitychange", () => {
     refreshDownloadController(true);
-    if (document.hidden) {
+    if (isPageActuallyHidden()) {
       if (pageKind === "vod") {
-        const seedUrl = lastMediaUrl ?? vodSelection.videoBaseUrl ?? vodSelection.audioBaseUrl;
-        if (seedUrl) {
-          scheduleVodPrefetch(seedUrl);
-        }
+        pumpVodBackgroundPrefetch(true);
       } else if (pageKind === "live") {
         void maybeRefreshLivePlaylist(true);
       }
     }
     publishStatus();
   });
+}
+
+function installVodVisibilityGuard(): void {
+  if (pageKind !== "vod") {
+    return;
+  }
+  defineDocumentGetter("hidden", spoofDocumentHidden);
+  defineDocumentGetter("visibilityState", spoofDocumentVisibilityState);
+  defineDocumentGetter("webkitHidden", spoofDocumentHidden);
+}
+
+function spoofDocumentHidden(): boolean {
+  return false;
+}
+
+function spoofDocumentVisibilityState(): DocumentVisibilityState {
+  return "visible";
 }
 
 function installMseHooks(): void {
@@ -670,6 +691,7 @@ function handleVodPlayurl(payload: any): void {
   updateDerivedMetrics();
   publishStatus();
   if (vodSelection.videoBaseUrl) {
+    lastVodPrefetchSeedUrl = vodSelection.videoBaseUrl;
     scheduleVodPrefetch(vodSelection.videoBaseUrl);
   }
 }
@@ -1111,7 +1133,10 @@ function installDebugSurface(): void {
 function installDownloadController(): void {
   window.setInterval(() => {
     refreshDownloadController();
-    if (pageKind === "live" && document.hidden) {
+    if (pageKind === "vod" && isPageActuallyHidden()) {
+      pumpVodBackgroundPrefetch();
+    }
+    if (pageKind === "live" && isPageActuallyHidden()) {
       void maybeRefreshLivePlaylist();
     }
     if (pageKind === "live" || prefetchQueue.length > 0 || prefetchActive > 0 || inflightRangeRequests.size > 0) {
@@ -1426,6 +1451,37 @@ function scheduleVodPrefetch(currentUrl: string): void {
   }
 }
 
+function pumpVodBackgroundPrefetch(force = false): void {
+  if (pageKind !== "vod" || state.mode === "off" || !isPageActuallyHidden()) {
+    return;
+  }
+
+  const now = Date.now();
+  if (!force && now - lastVodBackgroundPumpAt < VOD_BACKGROUND_PUMP_INTERVAL_MS) {
+    return;
+  }
+
+  const activeSegmentDownloads = prefetchActive + inflightRangeRequests.size;
+  const queueDepth = prefetchQueue.length + activeSegmentDownloads;
+  if (queueDepth >= Math.max(1, downloadController.controllerAppliedConcurrency)) {
+    return;
+  }
+
+  const targetBufferSeconds = resolveTargetBufferSeconds(downloadController.downloadPhase);
+  const cacheTargetBytes = resolveCacheTargetBytes(downloadController.downloadPhase, targetBufferSeconds);
+  if (cacheBytes > cacheTargetBytes + Math.max(8 * 1024 * 1024, cacheTargetBytes * 0.1)) {
+    return;
+  }
+
+  const seedUrl = resolveVodBackgroundSeedUrl();
+  if (!seedUrl) {
+    return;
+  }
+
+  lastVodBackgroundPumpAt = now;
+  scheduleVodPrefetch(seedUrl);
+}
+
 async function scheduleLivePlaylistPrefetch(playlistUrl: string, response: Response): Promise<void> {
   if (pageKind !== "live" || state.mode === "off") {
     return;
@@ -1546,6 +1602,23 @@ function getVodPrefetchContext(): {
     durationSeconds,
     remainingSeconds,
   };
+}
+
+function resolveVodBackgroundSeedUrl(): string | null {
+  const seekSeedUrl = seekState.active && !seekState.targetBuffered ? lastMediaUrl : null;
+  const candidates = [
+    seekSeedUrl,
+    lastVodPrefetchSeedUrl,
+    lastMediaUrl,
+    vodSelection.videoBaseUrl,
+    vodSelection.audioBaseUrl,
+  ];
+  for (const candidate of candidates) {
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return null;
 }
 
 function resolveVodDurationSeconds(payload: any): number | null {
@@ -1703,8 +1776,9 @@ async function runPrefetch(task: PrefetchTask): Promise<CacheEntry | null> {
   if (rangeEntry) {
     storeCacheEntry(rangeEntry);
     if (pageKind === "vod") {
+      lastVodPrefetchSeedUrl = resolveNextVodSeedUrl(task.url, rangeEntry) || task.url;
       scheduleVodPrefetch(task.url);
-    } else if (pageKind === "live" && document.hidden) {
+    } else if (pageKind === "live" && isPageActuallyHidden()) {
       void maybeRefreshLivePlaylist();
     }
     return rangeEntry;
@@ -1739,8 +1813,9 @@ async function runPrefetch(task: PrefetchTask): Promise<CacheEntry | null> {
     noteSegmentDuration(durationMs);
   }
   if (pageKind === "vod" && task.kind === "media") {
+    lastVodPrefetchSeedUrl = resolveNextVodSeedUrl(task.url, entry) || task.url;
     scheduleVodPrefetch(task.url);
-  } else if (pageKind === "live" && task.kind === "media" && document.hidden) {
+  } else if (pageKind === "live" && task.kind === "media" && isPageActuallyHidden()) {
     void maybeRefreshLivePlaylist();
   }
   return entry;
@@ -1832,7 +1907,10 @@ function scheduleAfterFullBodyCacheHit(url: string, resourceKind: ResourceKind, 
     if (pageKind === "vod") {
       const nextSeedUrl = resolveNextVodSeedUrl(url, entry);
       if (nextSeedUrl && nextSeedUrl !== url) {
+        lastVodPrefetchSeedUrl = nextSeedUrl;
         scheduleVodPrefetch(nextSeedUrl);
+      } else {
+        lastVodPrefetchSeedUrl = url;
       }
     } else if (pageKind === "live") {
       void maybeRefreshLivePlaylist();
@@ -2596,6 +2674,50 @@ function safelyParseUrl(url: string): URL | null {
   } catch {
     return null;
   }
+}
+
+function getDocumentGetter<T>(property: string): (() => T) | null {
+  const descriptor =
+    Object.getOwnPropertyDescriptor(Document.prototype, property) ??
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(document), property);
+  return typeof descriptor?.get === "function" ? descriptor.get.bind(document) as () => T : null;
+}
+
+function defineDocumentGetter<T>(property: string, getter: () => T): void {
+  try {
+    Object.defineProperty(document, property, {
+      configurable: true,
+      get: getter,
+    });
+  } catch {
+    return;
+  }
+}
+
+function isPageActuallyHidden(): boolean {
+  const ownHiddenGetter = Object.getOwnPropertyDescriptor(document, "hidden")?.get;
+  if (ownHiddenGetter && ownHiddenGetter !== spoofDocumentHidden) {
+    try {
+      return Boolean(ownHiddenGetter.call(document));
+    } catch {
+      return false;
+    }
+  }
+  if (nativeDocumentHiddenGetter) {
+    try {
+      return Boolean(nativeDocumentHiddenGetter());
+    } catch {
+      return false;
+    }
+  }
+  if (nativeDocumentVisibilityStateGetter) {
+    try {
+      return nativeDocumentVisibilityStateGetter() === "hidden";
+    } catch {
+      return false;
+    }
+  }
+  return document.visibilityState === "hidden";
 }
 
 function extractRequestUrl(input: RequestInfo | URL): string {

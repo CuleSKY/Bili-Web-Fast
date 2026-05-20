@@ -170,6 +170,124 @@ test.describe("extension local harness", () => {
     await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().prefetchHitCount ?? 0)).toBeGreaterThanOrEqual(3);
   });
 
+  test("keeps VOD page visibility exposed as visible to page scripts", async ({ page }) => {
+    await page.route("**/*", async (route) => {
+      const url = route.request().url();
+      if (route.request().resourceType() === "document" && url === "https://www.bilibili.com/video/BV1visible/") {
+        await route.fulfill({
+          contentType: "text/html",
+          body: "<html><body><video muted autoplay playsinline controls></video></body></html>",
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto("https://www.bilibili.com/video/BV1visible/");
+    await expectInjectedState(page);
+    await expect.poll(async () => page.evaluate(() => ({
+      hidden: document.hidden,
+      visibilityState: document.visibilityState,
+      webkitHidden: (document as Document & { webkitHidden?: boolean }).webkitHidden,
+    }))).toEqual({
+      hidden: false,
+      visibilityState: "visible",
+      webkitHidden: false,
+    });
+  });
+
+  test("continues VOD prefetch while hidden without another page media fetch", async ({ page }) => {
+    const segmentCounts = new Map<string, number>();
+    const vodDocument = `
+      <html>
+        <body>
+          <video muted autoplay playsinline controls></video>
+        </body>
+      </html>
+    `;
+
+    await page.route("**/*", async (route) => {
+      const url = route.request().url();
+      if (route.request().resourceType() === "document" && url === "https://www.bilibili.com/video/BV1hidden/") {
+        await route.fulfill({ contentType: "text/html", body: vodDocument });
+        return;
+      }
+      if (url.includes("playurl")) {
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({
+            data: {
+              timelength: 600_000,
+              dash: {
+                video: [
+                  {
+                    id: 120,
+                    codecs: "avc1.640033",
+                    bandwidth: 8_000_000,
+                    width: 3840,
+                    height: 2160,
+                    baseUrl: "https://upos-sz-mirror.bilivideo.com/upgcxcode/bg/video100.m4s",
+                  },
+                ],
+                audio: [
+                  {
+                    id: 30280,
+                    codecs: "mp4a.40.2",
+                    baseUrl: "https://upos-sz-mirror.bilivideo.com/upgcxcode/bg/audio100.m4s",
+                  },
+                ],
+              },
+            },
+          }),
+        });
+        return;
+      }
+      if (url.endsWith(".m4s")) {
+        if (route.request().method() === "HEAD") {
+          await route.fulfill({
+            status: 200,
+            headers: { "content-type": "video/iso.segment", "content-length": "1048576" },
+            body: "",
+          });
+          return;
+        }
+        segmentCounts.set(url, (segmentCounts.get(url) ?? 0) + 1);
+        await route.fulfill({
+          status: 200,
+          headers: { "content-type": "video/iso.segment", "content-length": "1048576" },
+          body: Buffer.alloc(2048, 3),
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto("https://www.bilibili.com/video/BV1hidden/");
+    await expectInjectedState(page);
+    await page.evaluate(() => window.__BWF_DEBUG__?.setMode("off"));
+    await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().mode)).toBe("off");
+    await page.evaluate(async () => {
+      const playurl = await fetch("https://api.bilibili.com/x/player/wbi/playurl?cid=2&bvid=BV1hidden");
+      const json = await playurl.json();
+      await fetch(json.data.dash.video[0].baseUrl);
+    });
+
+    expect([...segmentCounts.values()].reduce((sum, value) => sum + value, 0)).toBe(1);
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await page.waitForTimeout(1200);
+    expect([...segmentCounts.values()].reduce((sum, value) => sum + value, 0)).toBe(1);
+
+    await page.evaluate(() => window.__BWF_DEBUG__?.setMode("stable"));
+    await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().mode)).toBe("stable");
+    await expect.poll(async () => [...segmentCounts.values()].reduce((sum, value) => sum + value, 0)).toBeGreaterThan(1);
+    expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/bg/video101.m4s") ?? 0).toBeGreaterThan(0);
+    expect(segmentCounts.get("https://upos-sz-mirror.bilivideo.com/upgcxcode/bg/audio100.m4s") ?? 0).toBeGreaterThan(0);
+    await expect.poll(async () => page.evaluate(() => window.__BWF_DEBUG__?.getStatus().cacheBytes ?? 0)).toBeGreaterThan(0);
+  });
+
   test("keeps unresolved seek out of aggressive recovery and does not reuse stale seek targets", async ({ page }) => {
     const documentHtml = `
       <html>

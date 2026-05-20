@@ -8,6 +8,8 @@ playwright-report/
 coverage/
 vite.svg
 
+src/tests/
+
 # test artifacts
 test-results/
 .last-run.json
